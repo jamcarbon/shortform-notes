@@ -12,7 +12,8 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 }
 Write-Host "Installing Python 3.12 and shortform-notes dependencies. The first run takes about a minute."
 uv python install 3.12 --quiet
-uv sync --python 3.12 --extra all --extra local --extra ocr --upgrade-package yt-dlp --quiet
+# cuda: cuBLAS/cuDNN wheels for GPU Whisper (unused, and harmless, without an NVIDIA GPU).
+uv sync --python 3.12 --extra all --extra local --extra ocr --extra cuda --upgrade-package yt-dlp --quiet
 
 if ($args.Count -gt 0) { uv run shortform-notes @args; exit $LASTEXITCODE }
 
