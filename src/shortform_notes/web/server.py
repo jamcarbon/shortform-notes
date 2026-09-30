@@ -3,6 +3,9 @@
 No extra dependencies: stdlib ``http.server`` bound to 127.0.0.1 only, serving
 one HTML page and a few JSON endpoints. It writes the same config file the CLI,
 MCP server and Claude Code skill read, so choices made here apply everywhere.
+
+The Library view reads the local index (``library.py``) and serves notes and
+screenshots from the output folder through ``/files/``, never outside it.
 """
 
 from __future__ import annotations
@@ -16,11 +19,13 @@ import subprocess
 import sys
 import threading
 import webbrowser
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
-from shortform_notes import __version__, config
+from shortform_notes import __version__, config, library
 from shortform_notes.pipeline import ReelImportError, import_reel
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,14 @@ SAVABLE_KEYS = (
     "SHORTFORM_NOTES_OCR_PROVIDER",
     "SHORTFORM_NOTES_OCR_FPS",
 )
+# What /files/ will serve from the output folder; anything else is a 404.
+SERVABLE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".md": "text/plain; charset=utf-8",  # shown as text; "Open" hands it to the desktop app
+}
 
 
 # state (no machine scanning: only our own config file and package facts)
@@ -60,6 +73,42 @@ def describe() -> dict:
         "has_openai_key": bool(current.get("OPENAI_API_KEY")),
         "has_anthropic_key": bool(current.get("ANTHROPIC_API_KEY")),
     }
+
+
+def output_dir() -> Path:
+    try:
+        return config.load_settings().output_dir
+    except ValueError:  # a bad provider name in the config file; the folder is still readable
+        return Path(config.read_config_file().get("SHORTFORM_NOTES_DIR") or config.DEFAULT_OUTPUT_DIR).expanduser()
+
+
+def library_payload() -> dict:
+    """Every import, newest first, plus the categories present (for the filter) in taxonomy order."""
+    root = output_dir()
+    entries = []
+    for entry in library.load(root):
+        item = asdict(entry)
+        item["note_exists"] = (root / entry.note_path).exists()
+        entries.append(item)
+    try:
+        taxonomy = config.load_settings().categories
+    except ValueError:
+        taxonomy = config.DEFAULT_CATEGORIES
+    present = {e["category"] for e in entries if e["category"]}
+    ordered = [c for c in taxonomy if c in present] + sorted(present - set(taxonomy))
+    return {"output_dir": str(root), "entries": entries, "categories": ordered}
+
+
+def resolve_served(relative: str) -> Path | None:
+    """A file under the output folder with a servable type, or None. Blocks ``..`` and absolute paths."""
+    root = output_dir().resolve()
+    try:
+        target = (root / unquote(relative)).resolve()
+    except (OSError, ValueError):
+        return None
+    if not target.is_relative_to(root) or target.suffix.lower() not in SERVABLE_TYPES or not target.is_file():
+        return None
+    return target
 
 
 def cli_warning(provider: str) -> str | None:
@@ -101,7 +150,12 @@ class Handler(BaseHTTPRequestHandler):
         return data if isinstance(data, dict) else {}
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
-        if self.path in ("/", "/index.html"):
+        path = urlparse(self.path).path
+        if path.startswith("/files/"):
+            self._file(path.removeprefix("/files/"))
+        elif path == "/api/library":
+            self._json(200, library_payload())
+        elif self.path in ("/", "/index.html"):
             body = _load_index()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -112,6 +166,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, describe())
         else:
             self._json(404, {"error": "not found"})
+
+    def _file(self, relative: str) -> None:
+        target = resolve_served(relative)
+        if target is None:
+            self._json(404, {"error": "not found"})
+            return
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", SERVABLE_TYPES[target.suffix.lower()])
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/api/config":
@@ -162,7 +229,11 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {**result.to_dict(), "note": note})
 
     def _open_folder(self) -> None:
-        target = Path(str(self._read_json().get("path", ""))).expanduser()
+        raw = str(self._read_json().get("path", ""))
+        # A library entry sends its note path relative to the output folder.
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            target = resolve_served(raw) or output_dir() / "__missing__"
         if not target.exists():
             self._json(404, {"error": "no such path"})
             return

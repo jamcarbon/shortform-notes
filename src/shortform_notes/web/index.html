@@ -77,11 +77,28 @@
   summary { cursor: pointer; color: var(--muted); font-size: 14px; }
   a { color: var(--accent); text-decoration: underline; }
   .hidden { display: none !important; }
+  header nav { margin-left: auto; display: flex; gap: 16px; font-size: 14px; }
+  header nav a { text-decoration: none; color: var(--muted); }
+  header nav a.on { color: var(--text); font-weight: 600; }
+  .badge { display: inline-block; font-size: 12px; line-height: 18px; padding: 0 8px; border-radius: 9px; border: 1px solid var(--line-strong); color: var(--text); white-space: nowrap; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+  .chips button { font-size: 13px; padding: 2px 10px; border-radius: 12px; font-weight: 400; }
+  .chips button.on { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .lib-group h3 { margin: 24px 0 8px; font-size: 14px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .lib-row { display: grid; grid-template-columns: 56px 1fr; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+  .lib-row .thumb { width: 56px; height: 80px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--line); object-fit: cover; }
+  .lib-row .t { font-weight: 600; display: block; overflow-wrap: anywhere; }
+  .lib-row .meta { color: var(--muted); font-size: 13px; margin: 2px 0 4px; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+  .lib-row .links { font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .lib-row .links button { font-size: 13px; padding: 0; border: 0; background: none; color: var(--accent); text-decoration: underline; font-weight: 400; }
+  .empty { color: var(--muted); }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <header><h1>shortform-notes</h1><span class="ver" id="ver"></span></header>
+  <header><h1>shortform-notes</h1><span class="ver" id="ver"></span>
+    <nav><a href="#" id="navImport" onclick="go(3); return false">Import</a><a href="#library" id="navLibrary" onclick="showLibrary(); return false">Library</a></nav>
+  </header>
   <ul class="steps" id="steps"><li>Step 1 of 4</li><li>Step 2 of 4</li><li>Step 3 of 4</li><li>Step 4 of 4</li></ul>
 
   <!-- Step 0: method -->
@@ -144,7 +161,7 @@
     <p class="lead" id="summaryLine"></p>
     <div class="msg warn hidden" id="cliWarn"></div>
     <div class="row">
-      <input type="url" id="tryUrl" placeholder="https://www.instagram.com/p/DS3DPehEnpA/ or a TikTok or YouTube Shorts URL">
+      <input type="url" id="tryUrl" placeholder="An Instagram / Facebook Reel, TikTok or YouTube Shorts link">
       <button class="primary" id="tryBtn" onclick="tryImport()" style="flex:0 0 auto">Import</button>
     </div>
     <div class="msg" id="tryMsg"></div>
@@ -162,6 +179,14 @@
       <div><strong>Terminal</strong><p>Import from the terminal:</p><div class="pre-wrap"><pre id="cmdCli"></pre><button class="small" onclick="copyText('cmdCli', this)">Copy</button></div></div>
     </div>
     <div class="nav"><button class="ghost" onclick="go(2)">Change settings</button><button onclick="openFolder()">Open notes folder</button></div>
+  </section>
+
+  <!-- Library: every import, by category -->
+  <section class="card hidden" data-step="4">
+    <h2>Library</h2>
+    <p class="lead" id="libLead"></p>
+    <div class="chips" id="libChips"></div>
+    <div id="libList"></div>
   </section>
 </div>
 
@@ -182,6 +207,7 @@ async function boot() {
   state.ocr = st.current.SHORTFORM_NOTES_OCR === '1' ? (st.current.SHORTFORM_NOTES_OCR_PROVIDER || 'local') : 'off';
   renderSummaryOpts(); renderDir();
   const hash = /^#step=(\d)$/.exec(location.hash);  // deep link, used for docs screenshots
+  if (location.hash === '#library') return showLibrary();
   go(hash ? +hash[1] : st.config_exists ? 3 : 0);   // returning user: open the import page directly
 }
 
@@ -348,21 +374,67 @@ async function tryImport() {
     const r = await fetch('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
     const d = await r.json();
     if (!r.ok) { $('tryMsg').className = 'msg bad'; $('tryMsg').textContent = d.error; return; }
-    $('tryMsg').className = 'msg'; $('tryMsg').textContent = `Saved ${d.path.replace(st.home, '~')} (sources: ${d.sources.join(', ')})`;
-    $('tryResult').innerHTML = `<h3>${esc(d.title)}</h3>${d.summary ? `<p>${esc(d.summary)}</p>` : ''}${d.takeaways.length ? '<ul>' + d.takeaways.map(t => `<li>${esc(t)}</li>`).join('') + '</ul>' : ''}${d.warnings.length ? `<div class="msg warn">${d.warnings.map(w => 'Warning: ' + esc(w)).join('<br>')}</div>` : ''}<details><summary>Show the note file</summary><pre>${esc(d.note)}</pre></details>`;
+    $('tryMsg').className = 'msg'; $('tryMsg').textContent = `Saved ${d.path.replace(st.home, '~')} (sources: ${d.sources.join(', ')}; ${d.screenshot_count} screenshot${d.screenshot_count === 1 ? '' : 's'})`;
+    const extra = (d.category ? ` <span class="badge">${esc(d.category)}</span>` : '') + (d.notion_url ? ` <a href="${esc(d.notion_url)}" target="_blank" rel="noopener">Open in Notion</a>` : '');
+    $('tryResult').innerHTML = `<h3>${esc(d.title)}${extra}</h3>${d.summary ? `<p>${esc(d.summary)}</p>` : ''}${d.takeaways.length ? '<ul>' + d.takeaways.map(t => `<li>${esc(t)}</li>`).join('') + '</ul>' : ''}${d.warnings.length ? `<div class="msg warn">${d.warnings.map(w => 'Warning: ' + esc(w)).join('<br>')}</div>` : ''}<details><summary>Show the note file</summary><pre>${esc(d.note)}</pre></details>`;
     $('tryResult').classList.remove('hidden');
   } catch (e) { $('tryMsg').className = 'msg bad'; $('tryMsg').textContent = 'Error: ' + e; }
   finally { btn.disabled = false; }
 }
 async function openFolder() { await fetch('/api/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: st.current.SHORTFORM_NOTES_DIR || $('SHORTFORM_NOTES_DIR').value }) }); }
 function copyText(id, btn) { navigator.clipboard.writeText($(id).textContent).then(() => { btn.textContent = 'Copied'; setTimeout(() => btn.textContent = 'Copy', 1500); }); }
-function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function err(id, text) { $(id).textContent = text; $(id).classList.remove('hidden'); }
+
+// library
+let lib = null, libFilter = '';
+async function showLibrary() {
+  go(4);
+  $('libLead').textContent = 'Loading...';
+  lib = await (await fetch('/api/library')).json();
+  renderLibrary();
+}
+function renderLibrary() {
+  const all = lib.entries;
+  const count = (c) => all.filter(e => (e.category || 'Uncategorized') === c).length;
+  const cats = [...lib.categories, ...(all.some(e => !e.category) ? ['Uncategorized'] : [])];
+  $('libLead').textContent = all.length
+    ? `${all.length} import${all.length === 1 ? '' : 's'} in ${lib.output_dir.replace(st.home, '~')}.`
+    : 'Nothing imported yet. Paste a link on the Import page.';
+  $('libChips').innerHTML = all.length ? [['', `All (${all.length})`], ...cats.map(c => [c, `${c} (${count(c)})`])]
+    .map(([id, label]) => `<button class="${id === libFilter ? 'on' : ''}" data-cat="${esc(id)}">${esc(label)}</button>`).join('') : '';
+  $('libChips').querySelectorAll('button').forEach(b => b.addEventListener('click', () => { libFilter = b.dataset.cat; renderLibrary(); }));
+  const shown = cats.filter(c => !libFilter || c === libFilter);
+  $('libList').innerHTML = shown.map(c => {
+    const rows = all.filter(e => (e.category || 'Uncategorized') === c);
+    return `<div class="lib-group"><h3>${esc(c)}</h3>${rows.map(libRow).join('')}</div>`;
+  }).join('');
+  $('libList').querySelectorAll('[data-open]').forEach(b => b.addEventListener('click', () =>
+    fetch('/api/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: b.dataset.open }) })));
+}
+function fileUrl(rel) { return '/files/' + rel.split('/').map(encodeURIComponent).join('/'); }
+function libRow(e) {
+  const thumb = !e.thumbnail ? '' : /^https?:/.test(e.thumbnail) ? e.thumbnail : fileUrl(e.thumbnail);
+  const img = thumb ? `<img class="thumb" src="${esc(thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb'}))">` : '<div class="thumb"></div>';
+  const date = (e.imported_at || '').slice(0, 10);
+  const links = [
+    e.note_exists ? `<a href="${fileUrl(e.note_path)}" target="_blank">Note</a><button data-open="${esc(e.note_path)}">Open in app</button>` : '<span class="empty">note deleted</span>',
+    e.notion_url ? `<a href="${esc(e.notion_url)}" target="_blank" rel="noopener">Notion</a>` : '',
+    `<a href="${esc(e.url)}" target="_blank" rel="noopener">Original</a>`,
+  ].join('');
+  return `<div class="lib-row">${img}<div>
+    <span class="t">${esc(e.title)}</span>
+    <div class="meta"><span class="badge">${esc(e.category || 'Uncategorized')}</span><span>${esc(e.platform)}</span>${e.creator ? `<span>${esc(e.creator)}</span>` : ''}<span>${date}</span><span>${e.screenshot_count} screenshot${e.screenshot_count === 1 ? '' : 's'}</span></div>
+    <div class="links">${links}</div></div></div>`;
+}
 
 // nav
 function go(n) {
   if (n === 1) renderTranscribeOpts();
   if (n === 3) renderDone();
+  $('navImport').classList.toggle('on', n === 3);
+  $('navLibrary').classList.toggle('on', n === 4);
+  $('steps').classList.toggle('hidden', n >= 3);
   document.querySelectorAll('[data-step]').forEach(s => s.classList.toggle('hidden', +s.dataset.step !== n));
   [...$('steps').children].forEach((li, i) => { li.className = i < n ? 'done' : i === n ? 'now' : ''; });
   window.scrollTo({ top: 0 });

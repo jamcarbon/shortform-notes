@@ -60,3 +60,40 @@ def test_save_config_writes_file_and_creates_dir(client, tmp_path, monkeypatch):
 def test_import_rejects_bad_url(client):
     status, data = _json(client, "POST", "/api/import", {"url": "https://example.com/x"})
     assert status == 422 and "not a supported" in data["error"]
+
+
+def test_library_lists_imports_and_serves_only_output_files(client, tmp_path, monkeypatch):
+    from shortform_notes import library
+
+    out = tmp_path / "notes"
+    (out / "assets" / "n").mkdir(parents=True)
+    (out / "n.md").write_text("# note", encoding="utf-8")
+    (out / "assets" / "n" / "00-03.png").write_bytes(b"\x89PNG")
+    (out / "secret.env").write_text("TOKEN=x", encoding="utf-8")
+    (tmp_path / "outside.png").write_bytes(b"\x89PNG")
+    monkeypatch.setenv("SHORTFORM_NOTES_DIR", str(out))
+    base = dict(url="u", platform="youtube", note_path="n.md", thumbnail="assets/n/00-03.png")
+    library.record(out, library.LibraryEntry("2026-09-01T00:00:00", "Old", category="AI", **base))
+    library.record(
+        out,
+        library.LibraryEntry(
+            "2026-09-02T00:00:00", "New", category="Cooking & Recipes", **{**base, "note_path": "gone.md"}
+        ),
+    )
+    status, data = _json(client, "GET", "/api/library")
+    assert status == 200
+    assert [e["title"] for e in data["entries"]] == ["New", "Old"]  # newest first
+    assert [e["note_exists"] for e in data["entries"]] == [False, True]
+    assert data["categories"] == ["Cooking & Recipes", "AI"]  # taxonomy order, not alphabetical
+
+    for path, expected in [
+        ("/files/n.md", 200),
+        ("/files/assets/n/00-03.png", 200),
+        ("/files/secret.env", 404),  # not a servable type
+        ("/files/../outside.png", 404),  # outside the output folder
+        ("/files/..%2Foutside.png", 404),
+    ]:
+        client.request("GET", path)
+        resp = client.getresponse()
+        resp.read()
+        assert resp.status == expected, path
