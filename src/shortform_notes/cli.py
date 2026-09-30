@@ -177,6 +177,11 @@ async def _run(urls: list[str], args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Notes are UTF-8 (emoji, accents); a redirected stdout on Windows defaults to the ANSI code
+    # page, which would turn --json into bytes no JSON reader accepts.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(

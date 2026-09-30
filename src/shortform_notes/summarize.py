@@ -165,8 +165,9 @@ def build_prompt(audience: str, with_frames: bool = False, categories: Sequence[
             "result (the plated dish, the completed build, the before/after); or an object, place or "
             "technique whose look matters and is not described in words. Mark false for a person talking "
             "to camera, reaction shots, b-roll that only illustrates what is being said, transitions, "
-            "blurry or mid-cut frames, and on-screen text that just repeats the spoken words or the "
-            "caption. When several scenes show the same information, keep only the clearest one. Most "
+            "blurry or mid-cut frames, on-screen text that just repeats the spoken words or the "
+            "caption, and sponsor or self-promotion segments, logos and end cards. When several "
+            "scenes show the same information, keep only the clearest one. Most "
             "videos need zero to four screenshots; a talking-head video usually needs none."
         )
     if categories:
