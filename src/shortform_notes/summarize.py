@@ -20,7 +20,11 @@ image blocks, ``claude -p`` takes them as an API-style user message on its
 ``--input-format stream-json`` stdin, and ``codex exec`` takes them as ``-i``
 files. Only ``none``, which makes no call at all, cannot see them. The same
 call then also returns ``scenes``, a timestamped breakdown of what is on
-screen, which becomes the note's "Video breakdown" section.
+screen, which becomes the note's "Video breakdown" section, and marks each scene
+``keep_screenshot`` true or false: whether that frame shows something the narration
+does not already say. Only kept scenes become screenshots, so selectivity costs no
+extra call. Whenever a summary runs, the call also picks one ``category`` for the
+whole video from the configured taxonomy (``Settings.categories``).
 """
 
 from __future__ import annotations
@@ -72,17 +76,38 @@ _SCENES_PROPERTY = {
                     "warrants it. Only what is visible."
                 ),
             },
+            "keep_screenshot": {
+                "type": "boolean",
+                "description": (
+                    "True only if this frame shows information the transcript and caption do not already "
+                    "convey. Default to false."
+                ),
+            },
+            "reason": {"type": "string", "description": "One short line: why this frame is or is not worth keeping"},
         },
-        "required": ["time", "description"],
+        "required": ["time", "description", "keep_screenshot", "reason"],
         "additionalProperties": False,
     },
     "description": "Scene-by-scene breakdown, one entry per distinct moment, in chronological order",
 }
 
 
-def summary_schema(with_frames: bool = False) -> dict:
-    """The JSON contract every backend answers with. ``scenes`` is added only under vision."""
+def _category_property(categories: Sequence[str]) -> dict:
+    return {
+        "type": "string",
+        "enum": list(categories),
+        "description": "The single best-fitting category for the whole video, from the list",
+    }
+
+
+def summary_schema(with_frames: bool = False, categories: Sequence[str] = ()) -> dict:
+    """The JSON contract every backend answers with.
+
+    ``scenes`` is added only under vision, ``category`` whenever there is a taxonomy to choose from.
+    """
     properties = {**_TEXT_PROPERTIES, "scenes": _SCENES_PROPERTY} if with_frames else dict(_TEXT_PROPERTIES)
+    if categories:
+        properties["category"] = _category_property(categories)
     return {
         "type": "object",
         "properties": properties,
@@ -101,9 +126,10 @@ class Summary:
     summary: str
     takeaways: tuple[str, ...]
     scenes: tuple[Scene, ...] = ()  # empty unless the model saw the frames
+    category: str | None = None  # one of Settings.categories; None when no summary ran
 
 
-def build_prompt(audience: str, with_frames: bool = False) -> str:
+def build_prompt(audience: str, with_frames: bool = False, categories: Sequence[str] = ()) -> str:
     prompt = (
         f"You are turning a short social-media video into a personal note for {audience}. "
         "You are given the video's caption and/or spoken transcript. Return JSON with keys "
@@ -130,8 +156,27 @@ def build_prompt(audience: str, with_frames: bool = False) -> str:
             "grates a yellow onion into a glass bowl' beats 'someone prepares an ingredient'. Merge cells "
             "that show the same moment into one entry. Everything you write must be visible in the frames: "
             "detail means looking harder, never guessing, and never narrating what a video like this "
-            "usually does next."
+            "usually does next.\n"
+            "For every scene also decide keep_screenshot, with a one-line reason. The note keeps a "
+            "screenshot only of scenes marked true, and a note with three well-chosen screenshots beats one "
+            "with fifteen redundant ones, so the default is false. Mark true only when the frame carries "
+            "information a reader of the transcript and caption would otherwise miss: a diagram, chart, "
+            "table or slide; a written list, recipe card, code, settings screen or app UI; the finished "
+            "result (the plated dish, the completed build, the before/after); or an object, place or "
+            "technique whose look matters and is not described in words. Mark false for a person talking "
+            "to camera, reaction shots, b-roll that only illustrates what is being said, transitions, "
+            "blurry or mid-cut frames, and on-screen text that just repeats the spoken words or the "
+            "caption. When several scenes show the same information, keep only the clearest one. Most "
+            "videos need zero to four screenshots; a talking-head video usually needs none."
         )
+    if categories:
+        prompt += (
+            "\nAlso return category: the one category from this list that best fits the whole video, "
+            f"spelled exactly as listed: {'; '.join(categories)}. Choose by the subject matter a reader "
+            "would file it under, not by the format of the video."
+        )
+        if any(c.lower() == "other" for c in categories):
+            prompt += " Use Other only when nothing else fits."
     return prompt
 
 
@@ -194,9 +239,10 @@ def _cli_prompt(
 ) -> str:
     """Single-string prompt for agent CLIs: instructions, schema and content, JSON-only reply."""
     return (
-        f"{build_prompt(settings.audience, with_frames)}\n\n"
+        f"{build_prompt(settings.audience, with_frames, settings.categories)}\n\n"
         f"Reply with ONLY a JSON object matching this schema, no prose, no code fences:\n"
-        f"{json.dumps(summary_schema(with_frames))}\n\n{_user_message(caption, transcript, screen_text)}"
+        f"{json.dumps(summary_schema(with_frames, settings.categories))}\n\n"
+        f"{_user_message(caption, transcript, screen_text)}"
     )
 
 
@@ -262,24 +308,55 @@ def _scenes(raw: object) -> tuple[Scene, ...]:
         return ()
     scenes = []
     for item in raw:
+        keep, reason = False, ""
         if isinstance(item, dict):
             time, description = item.get("time"), str(item.get("description") or "").strip()
+            keep = _truthy(item.get("keep_screenshot"))
+            reason = str(item.get("reason") or "").strip()
         elif isinstance(item, str):  # a backend that ignored the schema answers with plain lines
             time, description = None, item.strip()
         else:
             continue
         if description:
-            scenes.append(Scene(time=_scene_time(time), description=description))
+            scenes.append(Scene(time=_scene_time(time), description=description, keep=keep, reason=reason))
     return tuple(scenes)
 
 
-def _coerce(data: dict, fallback_title: str) -> Summary:
+def _truthy(raw: object) -> bool:
+    """CLI backends are not schema-enforced and sometimes answer "true" or "yes" as strings."""
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("true", "yes", "1")
+    return raw is True
+
+
+def match_category(raw: object, categories: Sequence[str]) -> str | None:
+    """The taxonomy's own spelling of the model's answer; None when there is no taxonomy or no answer.
+
+    The API backends enforce the enum, but the CLI ones only read it, so a case or ``&``/``and``
+    slip is mapped back rather than creating a near-duplicate Notion option. An answer that is not
+    on the list at all becomes "Other" when the taxonomy has one.
+    """
+    text = str(raw or "").strip()
+    if not text or not categories:
+        return None
+
+    def norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower().replace("&", "and"))
+
+    by_norm = {norm(c): c for c in categories}
+    if norm(text) in by_norm:
+        return by_norm[norm(text)]
+    return next((c for c in categories if c.lower() == "other"), None)
+
+
+def _coerce(data: dict, fallback_title: str, categories: Sequence[str] = ()) -> Summary:
     takeaways = tuple(str(t).strip() for t in data.get("takeaways") or [] if str(t).strip())
     return Summary(
         title=(data.get("title") or fallback_title).strip(),
         summary=(data.get("summary") or "").strip(),
         takeaways=takeaways,
         scenes=_scenes(data.get("scenes")),
+        category=match_category(data.get("category"), categories),
     )
 
 
@@ -310,12 +387,16 @@ async def _summarize_openai(
     response = await client.chat.completions.create(
         model=settings.openai_summary_model,
         messages=[
-            {"role": "system", "content": build_prompt(settings.audience, with_frames=bool(grids))},
+            {"role": "system", "content": build_prompt(settings.audience, bool(grids), settings.categories)},
             {"role": "user", "content": user},
         ],
         response_format={
             "type": "json_schema",
-            "json_schema": {"name": "reel_summary", "strict": True, "schema": summary_schema(bool(grids))},
+            "json_schema": {
+                "name": "reel_summary",
+                "strict": True,
+                "schema": summary_schema(bool(grids), settings.categories),
+            },
         },
         # The GPT-5 family rejects `max_tokens` (400, "use max_completion_tokens") and any
         # temperature but the default, so neither appears here. The budget covers reasoning
@@ -344,10 +425,10 @@ async def _summarize_anthropic(
     client = AsyncAnthropic(api_key=settings.anthropic_api_key)
     response = await client.messages.create(
         model=settings.anthropic_summary_model,
-        max_tokens=2000,
-        system=build_prompt(settings.audience, with_frames=bool(grids)),
+        max_tokens=4000,  # scenes with a reason each outgrow 2000 tokens on a long, fast-cut video
+        system=build_prompt(settings.audience, bool(grids), settings.categories),
         messages=[{"role": "user", "content": content}],
-        output_config={"format": {"type": "json_schema", "schema": summary_schema(bool(grids))}},
+        output_config={"format": {"type": "json_schema", "schema": summary_schema(bool(grids), settings.categories)}},
     )
     if response.stop_reason == "refusal":
         raise SummaryError("model declined to summarize this video")
@@ -360,10 +441,14 @@ async def _summarize_anthropic(
 
 async def _run_cli(argv: list[str], stdin_text: str) -> str:
     """Run a CLI with the prompt on stdin; return stdout. Raises SummaryError on failure."""
-    if shutil.which(argv[0]) is None:
+    executable = shutil.which(argv[0])
+    if executable is None:
         raise SummaryError(f"`{argv[0]}` is not on PATH")
+    # The resolved path, not the bare name: on Windows npm installs `claude` and `codex` as
+    # `.cmd` shims, which CreateProcess only finds by full path (a bare name is WinError 2).
     proc = await asyncio.create_subprocess_exec(
-        *argv,
+        executable,
+        *argv[1:],
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -538,4 +623,7 @@ async def summarize(
     except Exception as exc:  # noqa: BLE001 (summary is best-effort; the verbatim note is still written)
         logger.warning("summary failed (%s): %s", settings.summary_provider, exc)
         return Summary(fallback_title, "", ())
-    return _coerce(data, fallback_title)
+    summary = _coerce(data, fallback_title, settings.categories)
+    kept = sum(scene.keep for scene in summary.scenes)
+    logger.info("summary: category=%s, %d of %d scenes kept", summary.category, kept, len(summary.scenes))
+    return summary

@@ -433,7 +433,7 @@ def test_scenes_are_only_asked_for_when_the_model_can_see():
     with_frames = summarize.summary_schema(with_frames=True)
     assert with_frames["required"] == ["title", "summary", "takeaways", "scenes"]
     cell = with_frames["properties"]["scenes"]["items"]
-    assert cell["required"] == ["time", "description"]
+    assert cell["required"] == ["time", "description", "keep_screenshot", "reason"]
     assert "scenes" not in summarize.build_prompt("me")
     assert "scenes" in summarize.build_prompt("me", with_frames=True)
 
@@ -498,7 +498,7 @@ def test_json_output_carries_scenes_only_when_there_are_some(tmp_path):
     plain = ReelImportResult(tmp_path / "n.md", "T", "S", ("a",), ("caption",), ())
     assert "scenes" not in plain.to_dict()  # a run without vision looks exactly as it did
     seen = ReelImportResult(tmp_path / "n.md", "T", "S", ("a",), ("caption", "video"), (), (Scene("00:03", "d"),))
-    assert seen.to_dict()["scenes"] == [{"time": "00:03", "description": "d"}]
+    assert seen.to_dict()["scenes"] == [{"time": "00:03", "description": "d", "keep": False, "reason": ""}]
 
 
 async def test_the_breakdown_reaches_the_saved_note(tmp_path):
@@ -510,7 +510,7 @@ async def test_the_breakdown_reaches_the_saved_note(tmp_path):
     ):
         result = await import_reel("https://www.tiktok.com/@c/video/1", settings(tmp_path))
     assert "## Video breakdown\n\n- [00:02] zest goes in" in result.path.read_text()
-    assert result.to_dict()["scenes"] == [{"time": "00:02", "description": "zest goes in"}]
+    assert result.to_dict()["scenes"] == [{"time": "00:02", "description": "zest goes in", "keep": False, "reason": ""}]
 
 
 def test_cli_points_at_the_breakdown_without_reprinting_it(tmp_path, capsys):
@@ -519,7 +519,7 @@ def test_cli_points_at_the_breakdown_without_reprinting_it(tmp_path, capsys):
     scenes = (Scene("00:03", "zest goes in"), Scene("00:05", "into the oven"))
     _print_result(ReelImportResult(tmp_path / "n.md", "T", "S", ("a",), ("caption", "video"), (), scenes), False)
     out = capsys.readouterr().out
-    assert "(2 scenes under 'Video breakdown' in the note)" in out
+    assert "(2 scenes under 'Video breakdown' in the note, 0 kept as screenshots)" in out
     assert "zest goes in" not in out  # the note holds the detail, the terminal stays short
 
 

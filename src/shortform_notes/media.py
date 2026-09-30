@@ -2,14 +2,17 @@
 
 ``bestaudio/best`` and no ffmpeg: Instagram and YouTube expose a standalone
 audio stream, TikTok falls through to the muxed mp4, and transcription APIs
-accept both. Never set a custom User-Agent; yt-dlp pairs its UA with the rest
-of the browser fingerprint and Instagram rejects mismatches.
+accept both. When the picture is wanted too, a muxed mp4 is used where one
+exists and, with ffmpeg on PATH, video and audio streams are merged where not.
+Never set a custom User-Agent; yt-dlp pairs its UA with the rest of the browser
+fingerprint and Instagram rejects mismatches.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -37,13 +40,27 @@ class DownloadedMedia:
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
+def _video_format() -> str:
+    """The yt-dlp format for a run that needs the picture.
+
+    YouTube has stopped serving a muxed mp4 for many Shorts (only DASH video-only and audio-only
+    streams), so with ffmpeg on PATH the best H.264 stream up to 1080p is merged with the audio;
+    H.264 because every decoder here (ffmpeg keyframes, OpenCV) reads it, which AV1 is not
+    guaranteed to be. Without ffmpeg nothing can merge, so only a muxed file will do.
+    """
+    muxed = "best[ext=mp4][height<=1080]/best"
+    if shutil.which("ffmpeg") is None:
+        return muxed
+    return f"bv*[height<=1080][vcodec^=avc1]+ba/bv*[height<=1080]+ba/{muxed}/bv*+ba"
+
+
 def _ytdlp_sync(url: str, tmpdir: str, download: bool, video: bool = False) -> DownloadedMedia:
     import yt_dlp  # lazy: heavy import, and tests stub this function
 
     warnings: list[str] = []
     opts = {
-        # A muxed mp4 when video is wanted (no ffmpeg merge step); otherwise the bare audio stream.
-        "format": "best[ext=mp4][height<=1080]/best" if video else "bestaudio/best",
+        "format": _video_format() if video else "bestaudio/best",
+        "merge_output_format": "mp4",
         "outtmpl": f"{tmpdir}/%(id)s.%(ext)s",
         "noplaylist": True,
         "quiet": True,

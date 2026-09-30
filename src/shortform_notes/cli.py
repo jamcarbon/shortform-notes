@@ -9,7 +9,13 @@ import logging
 import sys
 
 from shortform_notes import __version__
-from shortform_notes.config import OCR_PROVIDERS, SUMMARY_PROVIDERS, TRANSCRIBE_PROVIDERS, load_settings
+from shortform_notes.config import (
+    OCR_PROVIDERS,
+    SUMMARY_PROVIDERS,
+    TRANSCRIBE_PROVIDERS,
+    WHISPER_DEVICES,
+    load_settings,
+)
 from shortform_notes.ocr import FRAMES_PER_GRID
 from shortform_notes.pipeline import ReelImportError, import_reel
 from shortform_notes.summarize import MAX_VISION_FRAMES, vision_estimate
@@ -18,11 +24,15 @@ from shortform_notes.summarize import MAX_VISION_FRAMES, vision_estimate
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shortform-notes",
-        description="Turn Instagram Reels, TikToks and YouTube Shorts into Markdown notes.",
+        description=(
+            "Turn Instagram / Facebook Reels, TikToks and YouTube Shorts into Markdown notes, and optionally "
+            "Notion pages: transcript, a few well-chosen screenshots, category and summary."
+        ),
         epilog=(
             "Without an API key, summaries run through `claude` (Claude Code) or `codex` if either is on your PATH. "
             "Env: OPENAI_API_KEY, ANTHROPIC_API_KEY, SHORTFORM_NOTES_DIR, SHORTFORM_NOTES_SUMMARY_PROVIDER, "
-            "SHORTFORM_NOTES_TRANSCRIBE_PROVIDER, SHORTFORM_NOTES_AUDIENCE. See .env.example."
+            "SHORTFORM_NOTES_TRANSCRIBE_PROVIDER, SHORTFORM_NOTES_AUDIENCE, NOTION_TOKEN, NOTION_DATABASE_ID, "
+            "SHORTFORM_NOTES_CATEGORIES, SHORTFORM_NOTES_WHISPER_DEVICE. See .env.example."
         ),
     )
     parser.add_argument(
@@ -74,6 +84,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-vision", action="store_true", help="turn vision off even if the config enables it")
+    parser.add_argument(
+        "--notion",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "also write each reel as a page in a Notion database (default: on when NOTION_TOKEN and "
+            "NOTION_DATABASE_ID are set). Turns --vision on unless --no-vision is given, since the "
+            "screenshots are chosen by the model looking at the frames"
+        ),
+    )
+    parser.add_argument(
+        "--categories",
+        metavar="LIST",
+        help=(
+            "comma-separated category taxonomy for this run, e.g. 'Recipes, Fitness, Tech, Other' "
+            "(default: $SHORTFORM_NOTES_CATEGORIES or a built-in list); each video gets exactly one"
+        ),
+    )
+    parser.add_argument(
+        "--whisper-device",
+        choices=list(WHISPER_DEVICES),
+        help="local transcription device: auto (GPU when ctranslate2 sees one), cuda, or cpu",
+    )
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON instead of text")
     parser.add_argument("-v", "--verbose", action="store_true", help="show fetch/debug logs")
     parser.add_argument("--version", action="version", version=f"shortform-notes {__version__}")
@@ -85,13 +118,18 @@ def _print_result(result, as_json: bool) -> None:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return
     print(f"saved {result.path}  (sources: {', '.join(result.sources)})")
-    print(f"  {result.title}")
+    print(f"  {result.title}" + (f"  [{result.category}]" if result.category else ""))
+    if result.notion_url:
+        print(f"  notion: {result.notion_url}")
     if result.summary:
         print(f"  {result.summary}")
     for t in result.takeaways:
         print(f"  - {t}")
     if result.scenes:
-        print(f"  ({len(result.scenes)} scenes under 'Video breakdown' in the note)")
+        print(
+            f"  ({len(result.scenes)} scenes under 'Video breakdown' in the note, "
+            f"{result.screenshot_count} kept as screenshots)"
+        )
     for w in result.warnings:
         print(f"  warning: {w}")
 
@@ -106,7 +144,14 @@ async def _run(urls: list[str], args: argparse.Namespace) -> int:
         ocr_fps=args.ocr_fps,
         vision=False if args.no_vision else (True if args.vision else None),
         vision_agentic=False if args.no_vision else (True if args.vision == "agentic" else None),
+        notion=args.notion,
+        categories=args.categories,
+        whisper_device=args.whisper_device,
     )
+    if args.notion and not settings.can_write_notion and not args.json:
+        print(
+            "--notion: NOTION_TOKEN and NOTION_DATABASE_ID must both be set; writing local notes only", file=sys.stderr
+        )
     rate = f"{settings.ocr_fps:g} frames/s" if settings.ocr_fps else "every frame"
     if settings.ocr and settings.ocr_provider != "local" and not args.json:
         from shortform_notes.ocr import estimate

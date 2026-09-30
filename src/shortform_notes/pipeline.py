@@ -7,22 +7,32 @@ Each source is independent and the note records which ones succeeded:
   2. transcript yt-dlp ``bestaudio``, then OpenAI transcription or local faster-whisper.
   3. summary    one LLM call: OpenAI / Anthropic API, or the ``claude`` / ``codex``
                 CLI using an existing subscription. Best-effort. With ``vision``
-                on, the sampled video frames ride along in that same call.
+                on, the sampled video frames ride along in that same call, and
+                the model marks which scenes deserve a screenshot and picks a
+                category for the video.
+
+Then, each step best-effort and degrading to a warning in the note: the kept
+scenes' frames are saved as PNGs under ``<output_dir>/assets/<note>/``, a Notion
+page is created when NOTION_TOKEN and NOTION_DATABASE_ID are set, the Markdown
+note is written, and the import is recorded in the local library index. The
+video itself is only ever in a temporary directory.
 
 Typical cost with everything on: about $0.004 per minute-long reel.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
-from shortform_notes import instagram, media, ocr, urls
+from shortform_notes import instagram, library, media, notion_writer, ocr, urls
 from shortform_notes.config import AGENTIC_VISION_PROVIDERS, Settings, load_settings
 from shortform_notes.note import ReelContent, Scene, build_note, note_filename
 from shortform_notes.summarize import summarize, vision_estimate
@@ -62,6 +72,9 @@ class ReelImportResult:
     sources: tuple[str, ...]
     warnings: tuple[str, ...]
     scenes: tuple[Scene, ...] = ()  # only under --vision; see summarize.summary_schema
+    category: str | None = None
+    notion_url: str | None = None
+    screenshot_count: int = 0
 
     def to_dict(self) -> dict:
         data = {
@@ -71,6 +84,9 @@ class ReelImportResult:
             "takeaways": list(self.takeaways),
             "sources": list(self.sources),
             "warnings": list(self.warnings),
+            "category": self.category,
+            "notion_url": self.notion_url,
+            "screenshot_count": self.screenshot_count,
         }
         if self.scenes:  # absent, not empty, so a run without vision looks exactly as it did
             data["scenes"] = [scene.to_dict() for scene in self.scenes]
@@ -211,6 +227,50 @@ async def gather_content(url: str, tmpdir: str, settings: Settings) -> tuple[Ree
     return content, vision_frames
 
 
+ASSETS_DIR = "assets"
+
+
+def _save_screenshots_sync(
+    scenes: Sequence[Scene], frames: Sequence[ocr.Frame], output_dir: Path, note_slug: str
+) -> tuple[tuple[Scene, ...], list[str]]:
+    """Write the frame behind every kept scene to ``assets/<note_slug>/<mm-ss>.png``.
+
+    Returns the scenes with ``image_path`` set (relative to ``output_dir``, where the note lives)
+    and any warnings. Two kept scenes that resolve to the same frame share it: only the first
+    gets the image, so the note never shows one picture twice.
+    """
+    warnings: list[str] = []
+    used: set[float] = set()
+    out: list[Scene] = []
+    for scene in scenes:
+        frame = ocr.nearest_frame(frames, scene.time) if scene.keep else None
+        if frame is None or frame.seconds in used:
+            if scene.keep and frame is None:
+                warnings.append(f"Screenshot for scene {scene.time or '(no time)'} skipped: no matching frame")
+            out.append(scene)
+            continue
+        relative = f"{ASSETS_DIR}/{note_slug}/{ocr.timestamp(frame.seconds).replace(':', '-')}.png"
+        try:
+            target = output_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(frame.png)
+        except OSError as exc:
+            warnings.append(f"Screenshot {scene.time} could not be saved: {exc}")
+            out.append(scene)
+            continue
+        used.add(frame.seconds)
+        out.append(scene.with_image(relative))
+    return tuple(out), warnings
+
+
+async def save_screenshots(
+    scenes: Sequence[Scene], frames: Sequence[ocr.Frame], output_dir: Path, note_slug: str
+) -> tuple[tuple[Scene, ...], list[str]]:
+    if not frames or not any(scene.keep for scene in scenes):
+        return tuple(scenes), []
+    return await asyncio.to_thread(_save_screenshots_sync, scenes, frames, output_dir, note_slug)
+
+
 def _unique_path(directory: Path, filename: str, now: datetime) -> Path:
     path = directory / filename
     if not path.exists():
@@ -241,9 +301,81 @@ async def import_reel(url: str, settings: Settings | None = None, now: datetime 
     path = _unique_path(
         settings.output_dir, note_filename(content.posted or now, content.creator_handle, result.title), now
     )
-    note = build_note(content, result.title, result.summary, result.takeaways, now, result.scenes)
+    warnings = list(content.warnings)
+
+    try:
+        scenes, shot_warnings = await save_screenshots(result.scenes, frames, settings.output_dir, path.stem)
+        warnings += shot_warnings
+    except Exception as exc:  # noqa: BLE001 (screenshots are extra; the note is still written)
+        scenes = result.scenes
+        warnings.append(f"Screenshots could not be saved: {exc}")
+    screenshot_count = sum(1 for scene in scenes if scene.image_path)
+
+    notion_url = None
+    if settings.can_write_notion:
+        try:
+            page = await notion_writer.create_reel_page(
+                settings,
+                content,
+                result.title,
+                result.summary,
+                result.takeaways,
+                scenes,
+                result.category,
+                base_dir=settings.output_dir,
+            )
+            notion_url = page.url or None
+            warnings += page.warnings
+        except Exception as exc:  # noqa: BLE001 (Notion is a copy; the local note is the record)
+            logger.warning("Notion page not created: %s", exc)
+            warnings.append(f"Notion page not created: {exc}")
+    elif settings.notion and bool(settings.notion_token) != bool(settings.notion_database_id):
+        missing = "NOTION_DATABASE_ID" if settings.notion_token else "NOTION_TOKEN"
+        warnings.append(f"Notion skipped: {missing} is not set")
+
+    content = replace(content, warnings=tuple(warnings))
+    note = build_note(content, result.title, result.summary, result.takeaways, now, scenes, result.category, notion_url)
     path.write_text(note, encoding="utf-8")
-    logger.info("reel imported: %s sources=%s scenes=%d", path, content.sources, len(result.scenes))
+    logger.info(
+        "reel imported: %s sources=%s scenes=%d screenshots=%d category=%s",
+        path,
+        content.sources,
+        len(scenes),
+        screenshot_count,
+        result.category,
+    )
+
+    first_shot = next((scene.image_path for scene in scenes if scene.image_path), None)
+    try:
+        library.record(
+            settings.output_dir,
+            library.LibraryEntry(
+                imported_at=now.isoformat(),
+                title=result.title,
+                url=content.url,
+                platform=content.platform,
+                category=result.category,
+                note_path=path.name,
+                notion_url=notion_url,
+                creator=f"@{content.creator_handle}" if content.creator_handle else content.creator_name,
+                summary=result.summary,
+                screenshot_count=screenshot_count,
+                thumbnail=first_shot or content.thumbnail,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 (the index is a convenience; the note is already on disk)
+        logger.warning("library index not updated: %s", exc)
+        warnings.append(f"Library index not updated: {exc}")
+
     return ReelImportResult(
-        path, result.title, result.summary, result.takeaways, content.sources, content.warnings, result.scenes
+        path,
+        result.title,
+        result.summary,
+        result.takeaways,
+        content.sources,
+        tuple(warnings),
+        scenes,
+        category=result.category,
+        notion_url=notion_url,
+        screenshot_count=screenshot_count,
     )

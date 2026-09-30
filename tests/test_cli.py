@@ -6,7 +6,7 @@ from shortform_notes.pipeline import ReelImportError, ReelImportResult
 
 def test_cli_no_args_prints_help(capsys):
     assert main([]) == 2
-    assert "Turn Instagram Reels" in capsys.readouterr().out
+    assert "Turn Instagram / Facebook Reels" in capsys.readouterr().out
 
 
 def test_cli_json_output(tmp_path, capsys):

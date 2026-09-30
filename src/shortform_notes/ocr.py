@@ -24,6 +24,7 @@ import math
 import re
 import shutil
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -350,6 +351,37 @@ async def sample_frames(video_path: str, settings: Settings) -> list[Frame]:
 def timestamp(seconds: float) -> str:
     mm, ss = divmod(int(seconds), 60)
     return f"{mm:02d}:{ss:02d}"
+
+
+def parse_timestamp(label: str) -> float | None:
+    """``"01:07"`` (or ``"1:07"``, ``"00:01:07"``, ``"67"``) to seconds; None when it is not a time."""
+    parts = str(label or "").strip().strip("[]").split(":")
+    try:
+        values = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if not values or len(values) > 3:
+        return None
+    seconds = 0.0
+    for value in values:
+        seconds = seconds * 60 + value
+    return seconds
+
+
+def nearest_frame(frames: Sequence[Frame], label: str) -> Frame | None:
+    """The sampled frame a scene's ``mm:ss`` label came from.
+
+    The label is the contact-sheet cell's, which ``timestamp`` truncated to whole seconds, so the
+    frame that produced it is the one whose truncated time matches; failing an exact match (a
+    model rounding, or answering in seconds) the nearest one wins, ties to the earlier frame.
+    """
+    target = parse_timestamp(label)
+    if target is None or not frames:
+        return None
+    exact = [f for f in frames if int(f.seconds) == int(target)]
+    if exact:
+        return exact[0]
+    return min(frames, key=lambda f: (abs(f.seconds - target), f.seconds))
 
 
 # ── contact sheets ─────────────────────────────────────────────────────

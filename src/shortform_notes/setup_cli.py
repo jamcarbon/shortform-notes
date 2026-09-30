@@ -2,16 +2,21 @@
 
 Asks the same questions as the web page (summary backend, transcription,
 folder, audience) and writes the same config file, so either path leaves the
-tool in an identical state.
+tool in an identical state. It then checks the GPU for local Whisper and,
+optionally, connects a Notion database.
 """
 
 from __future__ import annotations
 
+import asyncio
 import getpass
 import sys
+from dataclasses import replace
 from pathlib import Path
 
-from shortform_notes import config
+from shortform_notes import config, notion_writer
+
+NOTION_INTEGRATIONS_URL = "https://www.notion.so/profile/integrations"
 
 SUMMARY_CHOICES = [
     ("claude-code", "Claude Code", "uses your Claude subscription through the claude CLI, no API key"),
@@ -63,6 +68,52 @@ def _ask_secret(label: str, existing: str, ask_secret=getpass.getpass) -> str:
         _say("A key is required for this option.")
 
 
+def report_gpu(requested: str = "auto") -> str:
+    """Say which device local Whisper will use, and why. Returns the device."""
+    from shortform_notes import transcribe
+
+    if not config._has_module("faster_whisper"):
+        _say('   Local Whisper is not installed yet: pip install "shortform-notes[local]"')
+        return "cpu"
+    device, compute = transcribe.resolve_device(requested)
+    if device == "cuda":
+        _say(f"   GPU found: local transcription will run on cuda ({compute}).")
+        _say('   If the first import logs "retrying on the CPU", install the CUDA libraries:')
+        _say('   pip install "shortform-notes[cuda]"')
+    else:
+        _say(f"   No CUDA GPU visible to ctranslate2: local transcription will run on the CPU ({compute}).")
+    return device
+
+
+def ask_notion(current: dict[str, str], ask=input, ask_secret=getpass.getpass) -> tuple[str, str]:
+    """Optional Notion connection. Returns (token, database id); empty strings when skipped."""
+    token, database = current.get("NOTION_TOKEN", ""), current.get("NOTION_DATABASE_ID", "")
+    _say("5/5  Also save each reel as a page in a Notion database? (optional)")
+    _say(f"   1. Create an internal integration at {NOTION_INTEGRATIONS_URL} and copy its")
+    _say("      Internal Integration Secret (starts with ntn_ or secret_).")
+    _say("   2. Open (or create) the database in Notion, click ••• → Connections, and add the integration.")
+    _say("   3. Copy the database link (••• → Copy link); the id is taken from it.")
+    _say("   Missing columns (Source URL, Platform, Category, Tags...) are added automatically.")
+    default = "y" if token and database else "n"
+    answer = ask(f"   Connect Notion? y/n [{default}]: ").strip().lower() or default
+    if not answer.startswith("y"):
+        return "", ""
+    token = _ask_secret("   Notion integration secret", token, ask_secret)
+    while True:
+        raw = ask(f"   Database link or id [{database or 'required'}]: ").strip() or database
+        database = config.normalize_notion_id(raw)
+        if database:
+            break
+    settings = config.load_settings(transcribe_provider="none", summary_provider="none")
+    try:
+        check = notion_writer.check_connection(replace(settings, notion_token=token, notion_database_id=database))
+        _say("   " + asyncio.run(check))
+    except Exception as exc:  # noqa: BLE001 (shown to the user; they can fix it and re-run setup)
+        _say(f"   Could not reach the database yet: {exc}")
+        _say("   Saved anyway; imports will warn until this is fixed.")
+    return token, database
+
+
 def run_setup(ask=input, ask_secret=getpass.getpass) -> Path:
     """Interactive wizard. ``ask``/``ask_secret`` are injectable for tests."""
     current = config.read_config_file()
@@ -71,7 +122,7 @@ def run_setup(ask=input, ask_secret=getpass.getpass) -> Path:
     _say()
 
     summary = _pick(
-        "1/4  Where should the summary run?",
+        "1/5  Where should the summary run?",
         SUMMARY_CHOICES,
         current.get("SHORTFORM_NOTES_SUMMARY_PROVIDER") or "claude-code",
         ask,
@@ -85,9 +136,12 @@ def run_setup(ask=input, ask_secret=getpass.getpass) -> Path:
     _say()
 
     transcribe_default = current.get("SHORTFORM_NOTES_TRANSCRIBE_PROVIDER") or ("openai" if openai_key else "local")
-    transcribe = _pick("2/4  How should audio be transcribed?", TRANSCRIBE_CHOICES, transcribe_default, ask)
+    transcribe = _pick("2/5  How should audio be transcribed?", TRANSCRIBE_CHOICES, transcribe_default, ask)
     if transcribe == "openai" and not openai_key:
         openai_key = _ask_secret("OpenAI API key", "", ask_secret)
+    whisper_device = current.get("SHORTFORM_NOTES_WHISPER_DEVICE", "")
+    if transcribe == "local":
+        report_gpu(whisper_device or "auto")
     _say()
 
     ocr_default = (
@@ -104,15 +158,18 @@ def run_setup(ask=input, ask_secret=getpass.getpass) -> Path:
     _say()
 
     default_dir = current.get("SHORTFORM_NOTES_DIR") or str(Path.home() / "shortform-notes")
-    folder = ask(f"3/4  Folder for notes [{default_dir}]: ").strip() or default_dir
+    folder = ask(f"3/5  Folder for notes [{default_dir}]: ").strip() or default_dir
     Path(folder).expanduser().mkdir(parents=True, exist_ok=True)
     _say()
 
     default_audience = current.get("SHORTFORM_NOTES_AUDIENCE", "")
     audience = ask(
-        f"4/4  Who are the notes for? Optional, shapes the summary [{default_audience or 'the reader'}]: "
+        f"4/5  Who are the notes for? Optional, shapes the summary [{default_audience or 'the reader'}]: "
     ).strip()
     audience = audience or default_audience
+    _say()
+
+    notion_token, notion_db = ask_notion(current, ask, ask_secret)
     _say()
 
     path = config.write_config_file(
@@ -126,6 +183,9 @@ def run_setup(ask=input, ask_secret=getpass.getpass) -> Path:
             "SHORTFORM_NOTES_AUDIENCE": audience,
             "OPENAI_API_KEY": openai_key,
             "ANTHROPIC_API_KEY": anthropic_key,
+            "NOTION_TOKEN": notion_token,
+            "NOTION_DATABASE_ID": notion_db,
+            "SHORTFORM_NOTES_WHISPER_DEVICE": whisper_device,
         }
     )
     _say(f"Saved {path}")

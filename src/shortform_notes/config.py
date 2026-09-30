@@ -13,6 +13,7 @@ LLM step, so it works with:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,39 @@ DEFAULT_OCR_FPS = 1.0  # one frame per second; 0 means every frame
 DEFAULT_OCR_OPENAI_MODEL = "gpt-5-mini"
 DEFAULT_OCR_ANTHROPIC_MODEL = "claude-sonnet-5"
 TRANSCRIBE_PROVIDERS = ("openai", "local", "none")
+WHISPER_DEVICES = ("auto", "cuda", "cpu")
 _FALSE = {"0", "false", "no", "off"}
+
+# Notion. Only the token and the target database are required; the version is pinned so a Notion
+# release cannot silently change request shapes under us (checked current on 2026-09-30).
+DEFAULT_NOTION_VERSION = "2026-03-11"
+# The whole video gets exactly one of these. Short and broad on purpose: a Notion select with
+# forty near-synonyms is not browsable. Override with SHORTFORM_NOTES_CATEGORIES or --categories.
+DEFAULT_CATEGORIES = (
+    "Cooking & Recipes",
+    "Fitness & Health",
+    "Tech & Software",
+    "AI",
+    "Business & Money",
+    "Productivity & Learning",
+    "Science & Education",
+    "DIY & Home",
+    "Travel",
+    "Style & Beauty",
+    "Entertainment & Humor",
+    "News & Commentary",
+    "Other",
+)
+
+
+def parse_categories(raw: str | None) -> tuple[str, ...]:
+    """Comma-separated taxonomy. Notion select options may not contain commas, so that is the separator."""
+    items = [c.strip() for c in (raw or "").split(",")]
+    seen: dict[str, None] = {}
+    for item in items:
+        if item and item.lower() not in {k.lower() for k in seen}:
+            seen[item] = None
+    return tuple(seen) or DEFAULT_CATEGORIES
 
 
 @dataclass(frozen=True)
@@ -64,6 +97,17 @@ class Settings:
     vision: bool  # attach the sampled frames to the summary call so the model sees the video
     vision_agentic: bool  # let an agent backend open the full-resolution frames itself
     fps_explicit: bool  # a rate was asked for, so use it instead of ffmpeg's cut-aware sampling
+    # Defaults below keep Settings(...) constructible the way it was before these fields existed.
+    whisper_device: str = "auto"  # one of WHISPER_DEVICES; auto picks CUDA when ctranslate2 sees a GPU
+    categories: tuple[str, ...] = DEFAULT_CATEGORIES
+    notion_token: str | None = None
+    notion_database_id: str | None = None
+    notion_version: str = DEFAULT_NOTION_VERSION
+    notion: bool = True  # False turns the Notion write off even when it is configured (--no-notion)
+
+    @property
+    def can_write_notion(self) -> bool:
+        return self.notion and bool(self.notion_token and self.notion_database_id)
 
     @property
     def can_transcribe(self) -> bool:
@@ -171,6 +215,9 @@ def load_settings(
     ocr_fps: float | None = None,
     vision: bool | None = None,
     vision_agentic: bool | None = None,
+    notion: bool | None = None,
+    categories: str | None = None,
+    whisper_device: str | None = None,
 ) -> Settings:
     """Build settings from env, with optional explicit overrides (CLI flags win)."""
     env = _env()
@@ -191,7 +238,13 @@ def load_settings(
     fps_raw = env.get("SHORTFORM_NOTES_OCR_FPS", "")
     fps = float(fps_raw) if ocr_fps is None and fps_raw else (DEFAULT_OCR_FPS if ocr_fps is None else ocr_fps)
     # SHORTFORM_NOTES_VISION takes 0/1 as before, and "agentic" to turn on the mode as well.
-    vision_raw = env.get("SHORTFORM_NOTES_VISION", "0").lower()
+    notion_token = env.get("NOTION_TOKEN") or None
+    notion_db = normalize_notion_id(env.get("NOTION_DATABASE_ID") or "") or None
+    notion_on = notion if notion is not None else True
+    notion_ready = notion_on and bool(notion_token and notion_db)
+    # Unset, vision follows Notion: the screenshots a Notion page shows are chosen by the model
+    # looking at the frames, so writing to Notion without vision would give pages with no images.
+    vision_raw = env.get("SHORTFORM_NOTES_VISION", "").lower() or ("1" if notion_ready else "0")
     vision_on = (vision_raw not in _FALSE) if vision is None else vision
     agentic_on = (vision_raw == "agentic") if vision_agentic is None else vision_agentic
     return Settings(
@@ -215,4 +268,21 @@ def load_settings(
         vision=vision_on,
         vision_agentic=agentic_on,
         fps_explicit=ocr_fps is not None or bool(fps_raw),
+        whisper_device=_validate(
+            whisper_device or env.get("SHORTFORM_NOTES_WHISPER_DEVICE") or "auto", WHISPER_DEVICES, "whisper device"
+        ),
+        categories=parse_categories(categories or env.get("SHORTFORM_NOTES_CATEGORIES")),
+        notion_token=notion_token,
+        notion_database_id=notion_db,
+        notion_version=env.get("NOTION_VERSION") or DEFAULT_NOTION_VERSION,
+        notion=notion_on,
     )
+
+
+def normalize_notion_id(raw: str) -> str:
+    """Accept a bare id, a dashed UUID, or the database's full share URL; return the 32-hex id."""
+    text = raw.strip()
+    # A share URL ends ".../<title>-<32 hex>?v=<view id>"; the view id is also 32 hex, so drop the query first.
+    text = text.split("?", 1)[0].split("#", 1)[0]
+    matches = re.findall(r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}", text)
+    return matches[-1].replace("-", "").lower() if matches else text
