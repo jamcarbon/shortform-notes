@@ -9,3 +9,4 @@ build/
 .env
 reels/
 uv.lock
+outputs/
