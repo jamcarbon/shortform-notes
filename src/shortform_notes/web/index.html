@@ -365,16 +365,23 @@ function renderDone() {
     $('skillifyPrompt').textContent = skillifyPrompt(kind);
   }
 }
-async function tryImport() {
+async function tryImport(force = false) {
   const url = $('tryUrl').value.trim(); if (!url) return;
   const btn = $('tryBtn'); btn.disabled = true;
   $('tryResult').classList.add('hidden');
   $('tryMsg').className = 'msg'; $('tryMsg').textContent = 'Working... Fetching, transcribing and summarizing takes 10 to 60 seconds. The first offline transcript also downloads the model.';
   try {
-    const r = await fetch('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+    const r = await fetch('/api/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, force }) });
     const d = await r.json();
     if (!r.ok) { $('tryMsg').className = 'msg bad'; $('tryMsg').textContent = d.error; return; }
-    $('tryMsg').className = 'msg'; $('tryMsg').textContent = `Saved ${d.path.replace(st.home, '~')} (sources: ${d.sources.join(', ')}; ${d.screenshot_count} screenshot${d.screenshot_count === 1 ? '' : 's'})`;
+    $('tryMsg').className = 'msg';
+    if (d.duplicate) {
+      $('tryMsg').innerHTML = `Already in your library: ${esc(d.path.replace(st.home, '~'))} (${esc(d.warnings[0] || '')}). <button id="reimportBtn">Re-import and replace</button>`;
+      $('reimportBtn').onclick = () => tryImport(true);
+      d.warnings = [];
+    } else {
+      $('tryMsg').textContent = `Saved ${d.path.replace(st.home, '~')} (sources: ${d.sources.join(', ')}; ${d.screenshot_count} screenshot${d.screenshot_count === 1 ? '' : 's'})`;
+    }
     const extra = (d.category ? ` <span class="badge">${esc(d.category)}</span>` : '') + (d.notion_url ? ` <a href="${esc(d.notion_url)}" target="_blank" rel="noopener">Open in Notion</a>` : '');
     $('tryResult').innerHTML = `<h3>${esc(d.title)}${extra}</h3>${d.summary ? `<p>${esc(d.summary)}</p>` : ''}${d.takeaways.length ? '<ul>' + d.takeaways.map(t => `<li>${esc(t)}</li>`).join('') + '</ul>' : ''}${d.warnings.length ? `<div class="msg warn">${d.warnings.map(w => 'Warning: ' + esc(w)).join('<br>')}</div>` : ''}<details><summary>Show the note file</summary><pre>${esc(d.note)}</pre></details>`;
     $('tryResult').classList.remove('hidden');

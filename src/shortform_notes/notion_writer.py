@@ -8,6 +8,9 @@ version ``Settings.notion_version`` (2026-03-11 when this was written):
    property schema lives there too. A data source id is accepted directly.
 2. Make sure the properties below exist, adding any that are missing (so an empty
    database works) and skipping, with a warning, any that exist with another type.
+   Then look for a page with the same video in ``Source URL`` (any spelling of its
+   link, see ``urls.reel_key``). One found is returned instead of creating a second;
+   under ``replace_existing`` it is moved to the trash and a new page made.
 3. Upload every kept screenshot: ``POST /v1/file_uploads`` then
    ``POST /v1/file_uploads/{id}/send`` with the bytes as multipart ``file``.
 4. Create the page with the properties and the first 100 blocks, append the rest
@@ -33,6 +36,7 @@ import httpx
 
 from shortform_notes.config import Settings
 from shortform_notes.note import ReelContent, Scene
+from shortform_notes.urls import reel_key, reel_search_term
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +80,7 @@ class NotionPage:
     id: str
     url: str
     warnings: tuple[str, ...] = ()
+    existing: bool = False  # an earlier page for the same video, linked instead of creating another
 
 
 # ── HTTP ───────────────────────────────────────────────────────────────
@@ -323,6 +328,32 @@ async def upload_image(notion: _Notion, path: Path) -> str:
     return created["id"]
 
 
+# ── existing pages ─────────────────────────────────────────────────────
+
+
+async def find_pages(notion: _Notion, schema: _Schema, url: str) -> list[dict]:
+    """Pages in the data source whose ``Source URL`` is this video, newest first.
+
+    Notion can only filter on a substring, so the filter narrows and ``reel_key`` decides.
+    """
+    key = reel_key(url)
+    found = await notion.request(
+        "POST",
+        f"/data_sources/{schema.data_source_id}/query",
+        json={
+            "filter": {"property": PROP_SOURCE, "url": {"contains": reel_search_term(key)}},
+            "sorts": [{"timestamp": "created_time", "direction": "descending"}],
+            "page_size": 20,
+        },
+    )
+    pages = []
+    for page in found.get("results") or []:
+        source = ((page.get("properties") or {}).get(PROP_SOURCE) or {}).get("url")
+        if source and reel_key(source) == key and not page.get("in_trash"):
+            pages.append(page)
+    return pages
+
+
 # ── entry point ────────────────────────────────────────────────────────
 
 
@@ -336,10 +367,13 @@ async def create_reel_page(
     category: str | None,
     base_dir: Path,
     http: httpx.AsyncClient | None = None,
+    replace_existing: bool = False,
 ) -> NotionPage:
     """Create the page and return its URL. Raises NotionError when the page itself cannot be made;
     a screenshot or cover that fails is a warning on the returned page instead.
 
+    When the database already has a page for this video, that page is returned (``existing``)
+    and nothing is written; with ``replace_existing`` it is trashed and a new one created.
     ``scenes[*].image_path`` is relative to ``base_dir`` (the note's folder).
     """
     if not settings.can_write_notion:
@@ -350,6 +384,23 @@ async def create_reel_page(
     try:
         notion = _Notion(http, settings)
         schema = await ensure_schema(notion, settings.notion_database_id or "", warnings)
+
+        if PROP_SOURCE in schema.usable:
+            try:
+                earlier = await find_pages(notion, schema, content.url)
+            except NotionError as exc:
+                earlier = []
+                warnings.append(f"Could not check Notion for an earlier page of this video: {exc}")
+            if earlier and not replace_existing:
+                page = earlier[0]
+                logger.info("Notion already has a page for this video: %s", page.get("url"))
+                return NotionPage(id=page["id"], url=page.get("url") or "", warnings=tuple(warnings), existing=True)
+            for page in earlier:
+                try:
+                    await notion.request("PATCH", f"/pages/{page['id']}", json={"in_trash": True})
+                    logger.info("moved the earlier Notion page to the trash: %s", page.get("url"))
+                except NotionError as exc:
+                    warnings.append(f"The earlier Notion page {page.get('url')} was not moved to the trash: {exc}")
 
         uploads: dict[str, str] = {}
         for scene in scenes:

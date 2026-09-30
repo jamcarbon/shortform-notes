@@ -17,6 +17,11 @@ page is created when NOTION_TOKEN and NOTION_DATABASE_ID are set, the Markdown
 note is written, and the import is recorded in the local library index. The
 video itself is only ever in a temporary directory.
 
+A link already in the library (any spelling of it, see ``urls.reel_key``) is not
+imported twice: the earlier note is returned and nothing runs, unless ``force``
+asks for a re-import, which replaces the earlier note, its screenshots and its
+Notion page. A note imported before Notion was set up is re-imported so it gets one.
+
 Typical cost with everything on: about $0.004 per minute-long reel.
 """
 
@@ -24,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -75,6 +81,7 @@ class ReelImportResult:
     category: str | None = None
     notion_url: str | None = None
     screenshot_count: int = 0
+    duplicate: bool = False  # already in the library: nothing ran, ``path`` is the earlier note
 
     def to_dict(self) -> dict:
         data = {
@@ -90,6 +97,8 @@ class ReelImportResult:
         }
         if self.scenes:  # absent, not empty, so a run without vision looks exactly as it did
             data["scenes"] = [scene.to_dict() for scene in self.scenes]
+        if self.duplicate:
+            data["duplicate"] = True
         return data
 
 
@@ -280,6 +289,30 @@ async def save_screenshots(
     return await asyncio.to_thread(_save_screenshots_sync, scenes, frames, output_dir, note_slug)
 
 
+def _already_imported(output_dir: Path, entry: library.LibraryEntry) -> ReelImportResult:
+    """The earlier import, as a result: nothing is fetched, summarized or written."""
+    logger.info("already imported on %s: %s", entry.imported_at[:10], entry.note_path)
+    return ReelImportResult(
+        output_dir / entry.note_path,
+        entry.title,
+        entry.summary,
+        (),
+        (),
+        (f"already imported on {entry.imported_at[:10]}; nothing was re-run",),
+        category=entry.category,
+        notion_url=entry.notion_url,
+        screenshot_count=entry.screenshot_count,
+        duplicate=True,
+    )
+
+
+def _inside(output_dir: Path, relative: str) -> Path | None:
+    """``output_dir / relative`` when it stays inside ``output_dir`` (the index is hand-editable)."""
+    root = output_dir.resolve()
+    target = (root / relative).resolve()
+    return target if target != root and target.is_relative_to(root) else None
+
+
 def _unique_path(directory: Path, filename: str, now: datetime) -> Path:
     path = directory / filename
     if not path.exists():
@@ -287,13 +320,22 @@ def _unique_path(directory: Path, filename: str, now: datetime) -> Path:
     return directory / f"{filename[:-3]}-{now.strftime('%H%M%S')}.md"
 
 
-async def import_reel(url: str, settings: Settings | None = None, now: datetime | None = None) -> ReelImportResult:
-    """Fetch, transcribe, summarize and write ``<output_dir>/<date>-<creator>-<slug>.md``."""
+async def import_reel(
+    url: str, settings: Settings | None = None, now: datetime | None = None, force: bool = False
+) -> ReelImportResult:
+    """Fetch, transcribe, summarize and write ``<output_dir>/<date>-<creator>-<slug>.md``.
+
+    A video already in the library comes back as that earlier import (``duplicate``) without
+    running anything; ``force`` re-imports it and replaces the earlier note and Notion page.
+    """
     settings = settings or load_settings()
     now = now or datetime.now(timezone.utc)
     clean = urls.detect_reel_url(url)
     if not clean:
         raise ReelImportError(f"not a supported Instagram / TikTok / YouTube Shorts link: {url}")
+    earlier = library.find(settings.output_dir, clean)
+    if earlier and not force and (earlier.notion_url or not settings.can_write_notion):
+        return _already_imported(settings.output_dir, earlier)
 
     with tempfile.TemporaryDirectory(prefix="shortform-notes-") as tmpdir:
         content, frames = await gather_content(clean, tmpdir, settings)
@@ -307,10 +349,15 @@ async def import_reel(url: str, settings: Settings | None = None, now: datetime 
     )
 
     settings.output_dir.mkdir(parents=True, exist_ok=True)
-    path = _unique_path(
-        settings.output_dir, note_filename(content.posted or now, content.creator_handle, result.title), now
-    )
+    filename = note_filename(content.posted or now, content.creator_handle, result.title)
+    if earlier and earlier.note_path == filename:
+        path = settings.output_dir / filename  # a re-import with the same title overwrites the earlier note
+    else:
+        path = _unique_path(settings.output_dir, filename, now)
     warnings = list(content.warnings)
+    earlier_assets = _inside(settings.output_dir, f"{ASSETS_DIR}/{Path(earlier.note_path).stem}") if earlier else None
+    if earlier_assets and earlier_assets.is_dir():
+        shutil.rmtree(earlier_assets, ignore_errors=True)  # before saving: the new note may reuse the folder
 
     try:
         scenes, shot_warnings = await save_screenshots(result.scenes, result.frames, settings.output_dir, path.stem)
@@ -332,9 +379,12 @@ async def import_reel(url: str, settings: Settings | None = None, now: datetime 
                 scenes,
                 result.category,
                 base_dir=settings.output_dir,
+                replace_existing=force,
             )
             notion_url = page.url or None
             warnings += page.warnings
+            if page.existing:
+                warnings.append("Notion already had a page for this video; linked it instead of creating another")
         except Exception as exc:  # noqa: BLE001 (Notion is a copy; the local note is the record)
             logger.warning("Notion page not created: %s", exc)
             warnings.append(f"Notion page not created: {exc}")
@@ -345,6 +395,9 @@ async def import_reel(url: str, settings: Settings | None = None, now: datetime 
     content = replace(content, warnings=tuple(warnings))
     note = build_note(content, result.title, result.summary, result.takeaways, now, scenes, result.category, notion_url)
     path.write_text(note, encoding="utf-8")
+    earlier_note = _inside(settings.output_dir, earlier.note_path) if earlier else None
+    if earlier_note and earlier_note != path.resolve():
+        earlier_note.unlink(missing_ok=True)
     logger.info(
         "reel imported: %s sources=%s scenes=%d screenshots=%d category=%s",
         path,

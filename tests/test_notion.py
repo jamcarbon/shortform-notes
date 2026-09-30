@@ -44,9 +44,12 @@ def notion_settings(tmp_path: Path, **overrides):
 class FakeNotion:
     """Just enough of the Notion API to record what the writer sends."""
 
-    def __init__(self, properties: dict | None = None, fail_patch_schema: bool = False) -> None:
+    def __init__(
+        self, properties: dict | None = None, fail_patch_schema: bool = False, existing: list[dict] | None = None
+    ) -> None:
         self.properties = properties if properties is not None else {"Title": {"type": "title"}}
         self.fail_patch_schema = fail_patch_schema
+        self.existing = existing or []  # pages the data source query returns
         self.calls: list[tuple[str, str, object]] = []
         self.uploads = 0
 
@@ -66,6 +69,8 @@ class FakeNotion:
             if self.fail_patch_schema:
                 return httpx.Response(403, json={"code": "restricted_resource", "message": "no"})
             return httpx.Response(200, json={"id": DS})
+        if method == "POST" and path == f"/data_sources/{DS}/query":
+            return httpx.Response(200, json={"object": "list", "results": self.existing, "has_more": False})
         if method == "POST" and path == "/file_uploads":
             self.uploads += 1
             return httpx.Response(200, json={"id": f"up-{self.uploads}", "status": "pending"})
@@ -76,7 +81,7 @@ class FakeNotion:
             return httpx.Response(200, json={"id": "page-1", "url": "https://www.notion.so/page-1"})
         if method == "PATCH" and path.startswith("/blocks/"):
             return httpx.Response(200, json={})
-        if method == "PATCH" and path == "/pages/page-1":
+        if method == "PATCH" and path.startswith("/pages/"):
             return httpx.Response(200, json={})
         return httpx.Response(404, json={"code": "object_not_found", "message": path})
 
@@ -363,3 +368,141 @@ def test_library_replaces_an_entry_for_the_same_note_and_survives_corruption(tmp
     assert [e.title for e in library.load(tmp_path)] == ["b"]
     library.library_path(tmp_path).write_text("{not json", encoding="utf-8")
     assert library.load(tmp_path) == []
+
+
+# ── de-duplication ─────────────────────────────────────────────────────
+
+
+def test_every_spelling_of_a_link_is_one_video():
+    same = [
+        ("https://www.instagram.com/reel/Ddh7h8rB1gh/?stkn=x", "https://instagram.com/p/Ddh7h8rB1gh"),
+        ("https://www.youtube.com/shorts/iLe2PLFdIgY?si=q", "https://youtu.be/iLe2PLFdIgY"),
+        ("https://www.facebook.com/watch/?v=42&ref=s", "https://m.facebook.com/watch?v=42"),
+        ("https://www.facebook.com/reel/42/", "https://www.facebook.com/somepage/videos/42"),
+        ("https://www.tiktok.com/@a/video/7300?lang=en", "https://m.tiktok.com/@a/video/7300"),
+        ("https://fb.watch/xyz/", "https://fb.watch/xyz"),
+    ]
+    for a, b in same:
+        assert urls.reel_key(a) == urls.reel_key(b), (a, b)
+    assert urls.reel_key("https://www.instagram.com/reel/A1/") != urls.reel_key("https://www.instagram.com/reel/B2/")
+    assert urls.reel_key("https://www.instagram.com/p/Ddh7h8rB1gh/") == "instagram:Ddh7h8rB1gh"
+    # The search term is a substring of every spelling, so Notion's "contains" filter finds them all.
+    for a, b in same:
+        term = urls.reel_search_term(urls.reel_key(a))
+        assert term in a and term in b
+
+
+def test_library_finds_a_video_under_another_spelling_only_while_its_note_exists(tmp_path):
+    (tmp_path / "a.md").write_text("note", encoding="utf-8")
+    url = "https://www.instagram.com/reel/X1/"
+    entry = library.LibraryEntry("2026-01-01T00:00:00", "a", url, "instagram", None, "a.md")
+    library.record(tmp_path, entry)
+    assert library.find(tmp_path, "https://instagram.com/p/X1?igsh=q") == entry
+    assert library.find(tmp_path, "https://www.instagram.com/reel/Y2/") is None
+    (tmp_path / "a.md").unlink()
+    assert library.find(tmp_path, url) is None  # deleting the note asks for a fresh import
+    # A re-import under another spelling and another note replaces the entry rather than adding one.
+    library.record(tmp_path, replace(entry, url="https://instagram.com/p/X1", note_path="b.md", title="b"))
+    assert [e.title for e in library.load(tmp_path)] == ["b"]
+
+
+async def test_a_link_already_in_the_library_runs_nothing(tmp_path):
+    s = settings(tmp_path)
+    with (
+        patch.object(pipeline, "gather_content", AsyncMock(return_value=(content(), []))),
+        patch.object(pipeline, "summarize", AsyncMock(return_value=Summary("Title", "Sum", ()))),
+    ):
+        first = await pipeline.import_reel("https://www.youtube.com/shorts/abc", s, now=NOW)
+    gather = AsyncMock()
+    with patch.object(pipeline, "gather_content", gather):
+        again = await pipeline.import_reel("https://youtu.be/abc?si=x", s, now=NOW)
+    gather.assert_not_called()
+    assert again.duplicate and again.path == first.path and again.title == "Title"
+    assert again.to_dict()["duplicate"] is True and "duplicate" not in first.to_dict()
+
+
+async def test_force_replaces_the_note_its_screenshots_and_the_library_entry(tmp_path):
+    s = settings(tmp_path)
+    frames = [ocr.Frame(3.0, b"old-png")]
+    kept = (Scene("00:03", "tray", keep=True, frame=1),)
+    old_summary = Summary("Old", "", (), kept, frames=tuple(frames))
+    with (
+        patch.object(pipeline, "gather_content", AsyncMock(return_value=(content(), frames))),
+        patch.object(pipeline, "summarize", AsyncMock(return_value=old_summary)),
+    ):
+        first = await pipeline.import_reel("https://www.youtube.com/shorts/abc", s, now=NOW)
+    old_assets = s.output_dir / "assets" / first.path.stem
+    assert (old_assets / "00-03.png").exists()
+    with (
+        patch.object(pipeline, "gather_content", AsyncMock(return_value=(content(), []))),
+        patch.object(pipeline, "summarize", AsyncMock(return_value=Summary("New title", "", ()))),
+    ):
+        second = await pipeline.import_reel("https://www.youtube.com/shorts/abc", s, now=NOW, force=True)
+    assert not second.duplicate and second.path != first.path
+    assert second.path.exists() and not first.path.exists() and not old_assets.exists()
+    assert [e.note_path for e in library.load(s.output_dir)] == [second.path.name]
+
+
+async def test_a_note_imported_before_notion_was_set_up_is_reimported_to_reach_notion(tmp_path):
+    with (
+        patch.object(pipeline, "gather_content", AsyncMock(return_value=(content(), []))),
+        patch.object(pipeline, "summarize", AsyncMock(return_value=Summary("Title", "", ()))),
+    ):
+        first = await pipeline.import_reel("https://www.youtube.com/shorts/abc", settings(tmp_path), now=NOW)
+    fake_page = notion_writer.NotionPage("p", "https://notion.so/p")
+    s = notion_settings(tmp_path)
+    with (
+        patch.object(pipeline, "gather_content", AsyncMock(return_value=(content(), []))),
+        patch.object(pipeline, "summarize", AsyncMock(return_value=Summary("Title", "", ()))),
+        patch.object(notion_writer, "create_reel_page", AsyncMock(return_value=fake_page)) as create,
+    ):
+        second = await pipeline.import_reel("https://www.youtube.com/shorts/abc", s, now=NOW)
+    assert create.call_args.kwargs["replace_existing"] is False
+    assert second.path == first.path and second.notion_url == "https://notion.so/p"  # same title: overwritten
+    [entry] = library.load(s.output_dir)
+    assert entry.notion_url == "https://notion.so/p"
+
+
+def _existing_page(url: str, page_id: str = "old-page") -> dict:
+    return {
+        "object": "page",
+        "id": page_id,
+        "url": f"https://www.notion.so/{page_id}",
+        "properties": {notion_writer.PROP_SOURCE: {"type": "url", "url": url}},
+    }
+
+
+async def test_notion_links_an_existing_page_for_the_same_video_instead_of_creating_one(tmp_path):
+    # "abc" also matches another video's link as a substring; reel_key tells them apart.
+    fake = FakeNotion(
+        existing=[_existing_page("https://youtu.be/abcdef", "other-video"), _existing_page("https://youtu.be/abc")]
+    )
+    async with fake.client() as http:
+        page = await notion_writer.create_reel_page(
+            notion_settings(tmp_path), content(), "T", "S", (), shots(tmp_path), None, base_dir=tmp_path, http=http
+        )
+    assert page.existing and page.id == "old-page" and page.url == "https://www.notion.so/old-page"
+    query = fake.find("POST", f"/data_sources/{DS}/query")[0]
+    assert query["filter"] == {"property": "Source URL", "url": {"contains": "abc"}}
+    assert not fake.find("POST", "/pages") and fake.uploads == 0  # nothing written, nothing uploaded
+
+
+async def test_notion_replace_trashes_the_earlier_page_then_creates_a_new_one(tmp_path):
+    fake = FakeNotion(existing=[_existing_page("https://www.youtube.com/shorts/abc")])
+    async with fake.client() as http:
+        page = await notion_writer.create_reel_page(
+            notion_settings(tmp_path),
+            content(),
+            "T",
+            "S",
+            (),
+            shots(tmp_path),
+            None,
+            base_dir=tmp_path,
+            http=http,
+            replace_existing=True,
+        )
+    assert not page.existing and page.id == "page-1"
+    assert fake.find("PATCH", "/pages/old-page") == [{"in_trash": True}]
+    methods = [(m, p) for m, p, _ in fake.calls]
+    assert methods.index(("PATCH", "/pages/old-page")) < methods.index(("POST", "/pages"))

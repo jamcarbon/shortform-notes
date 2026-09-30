@@ -15,6 +15,8 @@ import threading
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
+from shortform_notes.urls import reel_key
+
 logger = logging.getLogger(__name__)
 
 LIBRARY_FILE = ".library.json"
@@ -56,11 +58,20 @@ def _read(path: Path) -> list[dict]:
     return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
 
+def _same_reel(item: dict, key: str) -> bool:
+    return bool(item.get("url")) and reel_key(str(item["url"])) == key
+
+
 def record(output_dir: Path, entry: LibraryEntry) -> Path:
-    """Add ``entry`` (replacing an earlier entry for the same note) and write the index atomically."""
+    """Add ``entry`` and write the index atomically.
+
+    An earlier entry for the same note, or for the same video under any spelling of its link, is
+    replaced: a re-import supersedes the import before it.
+    """
     path = library_path(output_dir)
+    key = reel_key(entry.url)
     with _LOCK:
-        items = [item for item in _read(path) if item.get("note_path") != entry.note_path]
+        items = [item for item in _read(path) if item.get("note_path") != entry.note_path and not _same_reel(item, key)]
         items.append(asdict(entry))
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
@@ -78,3 +89,15 @@ def load(output_dir: Path) -> list[LibraryEntry]:
         except TypeError:  # a hand-edited entry missing a required field
             continue
     return sorted(entries, key=lambda e: e.imported_at, reverse=True)
+
+
+def find(output_dir: Path, url: str) -> LibraryEntry | None:
+    """The newest import of this video (any spelling of its link) whose note is still on disk.
+
+    An entry whose note was deleted does not count: deleting the note is how a user asks for a fresh import.
+    """
+    key = reel_key(url)
+    for entry in load(output_dir):
+        if entry.url and reel_key(entry.url) == key and (Path(output_dir) / entry.note_path).is_file():
+            return entry
+    return None

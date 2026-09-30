@@ -212,12 +212,13 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _import(self) -> None:
-        url = str(self._read_json().get("url", "")).strip()
+        body = self._read_json()
+        url = str(body.get("url", "")).strip()
         if not url:
             self._json(400, {"error": "missing url"})
             return
         try:
-            result = asyncio.run(import_reel(url, config.load_settings()))
+            result = asyncio.run(import_reel(url, config.load_settings(), force=body.get("force") is True))
         except ReelImportError as exc:
             self._json(422, {"error": str(exc)})
             return

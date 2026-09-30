@@ -576,7 +576,7 @@ async def test_vision_on_every_backend_downloads_the_video(tmp_path):
             patch(f"shortform_notes.summarize._summarize_{provider.replace('-', '_')}", AsyncMock(return_value=REPLY)),
         ):
             result = await import_reel(
-                "https://www.tiktok.com/@c/video/1", settings(tmp_path, summary_provider=provider)
+                "https://www.tiktok.com/@c/video/1", settings(tmp_path / provider, summary_provider=provider)
             )
         assert download.await_args.kwargs["video"] is True, provider
         assert result.sources == ("caption", "video"), provider

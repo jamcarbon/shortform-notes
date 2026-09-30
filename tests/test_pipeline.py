@@ -293,7 +293,7 @@ async def test_duplicate_filename_gets_suffix(tmp_path):
     s = settings(tmp_path)
     with patch.object(media, "download_media", AsyncMock(return_value=downloaded(audio_path=None))):
         first = await import_reel("https://www.tiktok.com/@chef/video/1", s, NOW)
-        second = await import_reel("https://www.tiktok.com/@chef/video/1", s, NOW)
+        second = await import_reel("https://www.tiktok.com/@chef/video/2", s, NOW)  # another video, same title
     assert first.path != second.path
     assert second.path.name.endswith("-203000.md")
 

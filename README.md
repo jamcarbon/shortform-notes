@@ -222,6 +222,8 @@ The CLI prints the estimate before running. Since OCR already reads on-screen te
 
 With vision on, the same single summary call also decides, for every scene in the breakdown, whether it deserves a screenshot: `keep_screenshot` true or false plus a one-line `reason`. The prompt biases hard toward false — a note with three well-chosen screenshots beats one with fifteen redundant ones — and keeps a frame only when it carries information a reader of the transcript would otherwise miss: a diagram, a written list or recipe card, code or an app screen, the finished result, or something whose look matters and is never described in words. Talking heads, b-roll that illustrates what is being said, transitions and on-screen text that repeats the narration are skipped. On a visual cooking Short that meant 3 of 12 scenes kept; a talking-head video usually keeps none.
 
+Each contact-sheet cell is labelled with a frame number and its timestamp (`#17 00:15`), and every scene names the number of the frame that shows it best. A kept scene's screenshot is exactly that frame, not merely one from the same second: a fast-cut reel has several frames in one second, and a scene often spans several cells.
+
 Kept frames are saved as `<output_dir>/assets/<note-name>/<mm-ss>.png` and embedded in the note under `## Screenshots`, captioned with the scene's description. Every scene's decision and reason are in `--json` output under `scenes`, which is where to look when tuning the prompt (`build_prompt()` in `summarize.py`). The video itself is only ever in a temporary directory; only the extracted text and these images are kept.
 
 The call also picks one category for the whole video from a fixed taxonomy, written to the note's frontmatter (`category:` and a tag) and to Notion. The default list is deliberately short and broad; set your own as a comma-separated list:
@@ -265,6 +267,12 @@ That is all. Notion writing is on whenever both are set (`--no-notion` skips it 
 A column that exists with a different type is left empty and noted in the import warnings rather than failing the page. Only `httpx` is needed, which is already a core dependency. Requests use Notion API version `2026-03-11` (`NOTION_VERSION` overrides it); since `2025-09-03` pages are created under the database's *data source*, which the writer resolves from the database id for you. Screenshots are uploaded with Notion's file-upload API, so they live in Notion, not on a link that can expire.
 
 Notion is a copy, never the record: if a request fails the Markdown note is still written, with the reason under `## Import warnings`.
+
+## Importing the same link twice
+
+A link that is already in the library is not imported again: the earlier note is returned at once (`already imported: …`, and `"duplicate": true` in `--json`) and nothing is downloaded or summarized. Every spelling of a link counts as the same video: `instagram.com/reel/X` and `/p/X`, `youtube.com/shorts/X` and `youtu.be/X`, with or without tracking parameters (`urls.reel_key`). Before creating a Notion page the writer also searches the database's `Source URL` column, so a page made from another machine is linked rather than duplicated.
+
+To re-import (say, after tuning the prompt), pass `--force`, or click **Re-import and replace** in the web page. It replaces the earlier note and its screenshots and moves the earlier Notion page to Notion's trash. Two other cases re-import on their own: a note you deleted, and a note imported before Notion was set up, so that it gets its page.
 
 ### Configuration reference
 
@@ -418,7 +426,7 @@ print(result.path, result.takeaways)
 - Instagram rate-limits datacenter IPs more aggressively than residential ones. Empty embeds on a server are usually this rate limit.
 - Screenshot choice is the model's judgement from contact-sheet thumbnails; it is good at "is this a talking head" and weaker at telling two similar frames apart. The `reason` for every scene is in `--json`.
 - YouTube no longer serves a combined audio+video file for many Shorts. With `--vision` or `--ocr`, ffmpeg must be on PATH to merge the two streams; without it those runs fall back to audio only.
-- Re-importing a link creates a second note and a second Notion page; nothing is de-duplicated.
+- De-duplication knows the video id for Instagram, YouTube, TikTok and most Facebook links. Share and redirect links (`instagram.com/share/…`, `vm.tiktok.com/…`, `fb.watch/…`) only match the same spelling, because resolving them needs a request.
 - One video at a time is the intended use. It is a personal-notes tool. Bulk scraping is out of scope; respect the platforms' terms and creators' work.
 
 ## Development

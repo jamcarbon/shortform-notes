@@ -107,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(WHISPER_DEVICES),
         help="local transcription device: auto (GPU when ctranslate2 sees one), cuda, or cpu",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="re-import a link that is already in the library, replacing its note, screenshots and Notion page",
+    )
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON instead of text")
     parser.add_argument("-v", "--verbose", action="store_true", help="show fetch/debug logs")
     parser.add_argument("--version", action="version", version=f"shortform-notes {__version__}")
@@ -116,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
 def _print_result(result, as_json: bool) -> None:
     if as_json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    if result.duplicate:
+        print(f"already imported: {result.path}  (--force re-imports it)")
+        print(f"  {result.title}" + (f"  [{result.category}]" if result.category else ""))
+        if result.notion_url:
+            print(f"  notion: {result.notion_url}")
         return
     print(f"saved {result.path}  (sources: {', '.join(result.sources)})")
     print(f"  {result.title}" + (f"  [{result.category}]" if result.category else ""))
@@ -166,7 +177,7 @@ async def _run(urls: list[str], args: argparse.Namespace) -> int:
     failures = 0
     for url in urls:
         try:
-            _print_result(await import_reel(url, settings), args.json)
+            _print_result(await import_reel(url, settings, force=args.force), args.json)
         except ReelImportError as exc:
             failures += 1
             if args.json:

@@ -21,15 +21,17 @@ def build_server():
     server = _Server("shortform-notes")
 
     @server.tool()
-    async def import_shortform_note(url: str) -> str:
+    async def import_shortform_note(url: str, force: bool = False) -> str:
         """Import an Instagram reel/post, TikTok, or YouTube Short into a Markdown note.
 
         Fetches the caption, transcribes the audio (if OPENAI_API_KEY is set), writes
         <SHORTFORM_NOTES_DIR>/<date>-<creator>-<slug>.md and returns the title, summary,
         takeaways and note path as JSON. Call it when the user shares such a link.
+        A link already imported returns the earlier note with "duplicate": true and runs
+        nothing; pass force=true only when the user asks to re-import it.
         """
         try:
-            result = await import_reel(url, load_settings())
+            result = await import_reel(url, load_settings(), force=force)
         except ReelImportError as exc:
             return json.dumps({"error": str(exc)})
         return json.dumps(result.to_dict(), ensure_ascii=False)

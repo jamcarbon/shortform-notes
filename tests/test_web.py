@@ -77,7 +77,7 @@ def test_library_lists_imports_and_serves_only_output_files(client, tmp_path, mo
     library.record(
         out,
         library.LibraryEntry(
-            "2026-09-02T00:00:00", "New", category="Cooking & Recipes", **{**base, "note_path": "gone.md"}
+            "2026-09-02T00:00:00", "New", category="Cooking & Recipes", **{**base, "url": "v", "note_path": "gone.md"}
         ),
     )
     status, data = _json(client, "GET", "/api/library")
