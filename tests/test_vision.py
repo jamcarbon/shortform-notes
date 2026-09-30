@@ -134,7 +134,9 @@ async def test_tile_frames_builds_chronological_sheets():
     assert first.shape[:2] == (320 * 4, 180 * 4)  # 4x4 of cells already at the 320 max side
     partial = cv2.imdecode(np.frombuffer(sheets[1].png, dtype="uint8"), cv2.IMREAD_COLOR)
     assert partial.shape[:2] == (320, 180 * 4)  # one padded row, not a ragged image
-    assert sheets[1].describe() == "4 frames, 00:16 to 00:19"
+    assert sheets[1].numbers == (17, 18, 19, 20)  # numbered across sheets, as the model names them
+    assert sheets[1].describe() == "4 frames, #17 to #20, 00:16 to 00:19"
+    assert ocr.cell_label(17, 16.4) == "#17 00:16"
 
 
 async def test_tile_frames_downscales_and_labels_cells():
@@ -162,7 +164,7 @@ async def test_sheets_reach_the_openai_payload(tmp_path):
     assert images[0]["image_url"]["detail"] == "high"  # low resizes the sheet to a thumbnail
     assert content[0]["text"].startswith("Caption:\ncap")
     labels = [part.get("text") or "" for part in content]
-    assert any(label.startswith("contact sheet 1 of 2: 16 frames, 00:00 to 00:15") for label in labels)
+    assert any(label.startswith("contact sheet 1 of 2: 16 frames, #1 to #16, 00:00 to 00:15") for label in labels)
     assert "contact sheets of frames sampled" in sent["messages"][0]["content"]
 
 
@@ -290,10 +292,11 @@ async def test_codex_without_vision_passes_no_images(tmp_path):
 # ── agentic vision ─────────────────────────────────────────────────────
 
 
-def test_frame_filenames_are_timestamps():
-    assert summarize.frame_filename(0) == "00-00.png"
-    assert summarize.frame_filename(3) == "00-03.png"
-    assert summarize.frame_filename(75) == "01-15.png"
+def test_frame_filenames_are_the_cell_labels():
+    assert summarize.frame_filename(1, 0) == "01_00-00.png"
+    assert summarize.frame_filename(7, 3.2) == "07_00-03.png"
+    assert summarize.frame_filename(8, 3.7) == "08_00-03.png"  # same second, its own file
+    assert summarize.frame_filename(48, 75) == "48_01-15.png"
 
 
 def test_oneshot_argv_still_disables_every_tool(tmp_path):
@@ -322,7 +325,7 @@ async def test_agentic_claude_code_writes_frames_and_names_them_in_the_prompt(tm
         directory = Path(argv[argv.index("--add-dir") + 1])
         seen["dir"] = directory
         seen["files"] = sorted(p.name for p in directory.iterdir())
-        seen["png"] = (directory / "00-00.png").read_bytes()[:8]
+        seen["png"] = (directory / "01_00-00.png").read_bytes()[:8]
         seen["prompt"] = json.loads(stdin)["message"]["content"][0]["text"]
         return stream_json_output()
 
@@ -331,9 +334,9 @@ async def test_agentic_claude_code_writes_frames_and_names_them_in_the_prompt(tm
             "cap", None, settings(tmp_path, summary_provider="claude-code", vision_agentic=True), frames=frames(3)
         )
     assert result.title == "T"
-    assert seen["files"] == ["00-00.png", "00-01.png", "00-02.png"]
+    assert seen["files"] == ["01_00-00.png", "02_00-01.png", "03_00-02.png"]
     assert seen["png"] == b"\x89PNG\r\n\x1a\n"  # the real frame, not a placeholder
-    assert str(seen["dir"]) in seen["prompt"] and "00-01.png" in seen["prompt"]
+    assert str(seen["dir"]) in seen["prompt"] and "02_00-01.png" in seen["prompt"]
     assert "Open any frame you need" in seen["prompt"]
     assert not seen["dir"].exists()  # torn down with the call, like the downloaded media
 
@@ -363,7 +366,7 @@ async def test_agentic_codex_puts_the_frames_dir_in_the_prompt(tmp_path):
             "cap", None, settings(tmp_path, summary_provider="codex", vision_agentic=True), frames=frames(3)
         )
     assert result.title == "T"
-    assert seen["files"] == ["00-00.png", "00-01.png", "00-02.png"]
+    assert seen["files"] == ["01_00-00.png", "02_00-01.png", "03_00-02.png"]
     assert not seen["dir"].exists()
 
 
@@ -402,9 +405,11 @@ def test_select_frames_caps_and_spreads():
 async def test_summarize_never_sends_more_than_the_cap(tmp_path):
     sent = {}
     with stub_openai(sent):
-        await summarize.summarize("cap", None, settings(tmp_path), frames=frames(200))
+        result = await summarize.summarize("cap", None, settings(tmp_path), frames=frames(200))
     images = [part for part in sent["messages"][1]["content"] if part["type"] == "image_url"]
     assert len(images) == MAX_VISION_FRAMES // ocr.FRAMES_PER_GRID == 3
+    # The summary carries the frames it showed, so a scene's frame number resolves against those, not all 200.
+    assert list(result.frames) == select_frames(frames(200))
 
 
 def test_vision_estimate_prices_sheets_not_frames(tmp_path):
@@ -433,7 +438,7 @@ def test_scenes_are_only_asked_for_when_the_model_can_see():
     with_frames = summarize.summary_schema(with_frames=True)
     assert with_frames["required"] == ["title", "summary", "takeaways", "scenes"]
     cell = with_frames["properties"]["scenes"]["items"]
-    assert cell["required"] == ["time", "description", "keep_screenshot", "reason"]
+    assert cell["required"] == ["time", "frame", "description", "keep_screenshot", "reason"]
     assert "scenes" not in summarize.build_prompt("me")
     assert "scenes" in summarize.build_prompt("me", with_frames=True)
 

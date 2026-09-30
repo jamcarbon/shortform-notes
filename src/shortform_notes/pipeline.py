@@ -235,21 +235,29 @@ def _save_screenshots_sync(
 ) -> tuple[tuple[Scene, ...], list[str]]:
     """Write the frame behind every kept scene to ``assets/<note_slug>/<mm-ss>.png``.
 
+    ``frames`` must be the frames the model was shown, in cell-number order (``Summary.frames``):
+    a scene names its frame by that number, and falls back to its timestamp when it gave none.
     Returns the scenes with ``image_path`` set (relative to ``output_dir``, where the note lives)
     and any warnings. Two kept scenes that resolve to the same frame share it: only the first
     gets the image, so the note never shows one picture twice.
     """
     warnings: list[str] = []
-    used: set[float] = set()
+    used: set[int] = set()
+    names: set[str] = set()
     out: list[Scene] = []
     for scene in scenes:
-        frame = ocr.nearest_frame(frames, scene.time) if scene.keep else None
-        if frame is None or frame.seconds in used:
+        frame = None
+        if scene.keep:
+            frame = ocr.frame_by_number(frames, scene.frame) or ocr.nearest_frame(frames, scene.time)
+        if frame is None or id(frame) in used:
             if scene.keep and frame is None:
                 warnings.append(f"Screenshot for scene {scene.time or '(no time)'} skipped: no matching frame")
             out.append(scene)
             continue
-        relative = f"{ASSETS_DIR}/{note_slug}/{ocr.timestamp(frame.seconds).replace(':', '-')}.png"
+        name = ocr.timestamp(frame.seconds).replace(":", "-")
+        if name in names:  # two frames inside one second
+            name = f"{name}-{sum(n.startswith(name) for n in names) + 1}"
+        relative = f"{ASSETS_DIR}/{note_slug}/{name}.png"
         try:
             target = output_dir / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -258,7 +266,8 @@ def _save_screenshots_sync(
             warnings.append(f"Screenshot {scene.time} could not be saved: {exc}")
             out.append(scene)
             continue
-        used.add(frame.seconds)
+        used.add(id(frame))
+        names.add(name)
         out.append(scene.with_image(relative))
     return tuple(out), warnings
 
@@ -304,7 +313,7 @@ async def import_reel(url: str, settings: Settings | None = None, now: datetime 
     warnings = list(content.warnings)
 
     try:
-        scenes, shot_warnings = await save_screenshots(result.scenes, frames, settings.output_dir, path.stem)
+        scenes, shot_warnings = await save_screenshots(result.scenes, result.frames, settings.output_dir, path.stem)
         warnings += shot_warnings
     except Exception as exc:  # noqa: BLE001 (screenshots are extra; the note is still written)
         scenes = result.scenes

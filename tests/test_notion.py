@@ -223,6 +223,39 @@ def test_only_kept_scenes_are_saved_and_each_frame_once(tmp_path):
     assert warnings == []
 
 
+def test_the_numbered_frame_is_saved_not_the_first_one_in_that_second(tmp_path):
+    # A fast-cut reel puts several frames inside one second; the scene's time names the second,
+    # its frame number names the cell the model actually described. That cell is the screenshot.
+    frames = [ocr.Frame(15.0, b"transition"), ocr.Frame(15.6, b"close-up"), ocr.Frame(33.9, b"zoomed-out")]
+    scenes = [
+        Scene("00:15", "the close-up", keep=True, frame=2),
+        Scene("00:15", "the transition too", keep=True, frame=1),
+        Scene("00:33", "no number: falls back to the time", keep=True),
+        Scene("00:40", "number out of range, time matches nothing close", keep=True, frame=9),
+    ]
+    out, warnings = pipeline._save_screenshots_sync(scenes, frames, tmp_path, "note")
+    assert [s.image_path for s in out] == [
+        "assets/note/00-15.png",
+        "assets/note/00-15-2.png",  # same second, different frame: its own file, not an overwrite
+        "assets/note/00-33.png",
+        None,  # the time fallback resolves to 00:33's frame, which is already used
+    ]
+    assert (tmp_path / "assets/note/00-15.png").read_bytes() == b"close-up"
+    assert (tmp_path / "assets/note/00-15-2.png").read_bytes() == b"transition"
+    assert warnings == []
+
+
+def test_frame_numbers_from_cli_backends_are_understood():
+    scenes = [
+        {"time": "00:01", "frame": n, "description": "d", "keep_screenshot": True, "reason": "r"}
+        for n in (3, "4", "#5", "", None, True, "five")
+    ]
+    summary = _coerce({"title": "t", "scenes": scenes}, "fb")
+    assert [s.frame for s in summary.scenes] == [3, 4, 5, None, None, None, None]
+    assert ocr.frame_by_number([ocr.Frame(0.0, b"a")], 1).png == b"a"
+    assert ocr.frame_by_number([ocr.Frame(0.0, b"a")], 0) is None
+
+
 def test_note_embeds_only_kept_screenshots_and_shows_the_category():
     scenes = [Scene("00:01", "face"), Scene("00:03", "tray", keep=True).with_image("assets/n/00-03.png")]
     md = build_note(content(), "T", "S", (), NOW, scenes, "Cooking & Recipes", "https://notion.so/x")
@@ -272,7 +305,12 @@ async def test_import_writes_screenshots_notion_and_library(tmp_path):
     s = notion_settings(tmp_path)
     frames = [ocr.Frame(3.0, b"png-bytes")]
     summary = Summary(
-        "Title", "Sum", ("t",), (Scene("00:03", "tray", keep=True, reason="result"), Scene("00:04", "face")), "AI"
+        "Title",
+        "Sum",
+        ("t",),
+        (Scene("00:03", "tray", keep=True, reason="result", frame=1), Scene("00:04", "face")),
+        "AI",
+        frames=tuple(frames),
     )
     fake_page = notion_writer.NotionPage("p", "https://notion.so/p", ("a screenshot warning",))
     with (

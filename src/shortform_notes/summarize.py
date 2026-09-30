@@ -38,7 +38,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from shortform_notes import ocr
@@ -68,6 +68,13 @@ _SCENES_PROPERTY = {
         "type": "object",
         "properties": {
             "time": {"type": "string", "description": "Timestamp as printed on the frame, mm:ss"},
+            "frame": {
+                "type": "integer",
+                "description": (
+                    "Number printed after # on the cell that best shows this moment. For a kept scene, "
+                    "that exact frame becomes the screenshot, so pick the clearest cell"
+                ),
+            },
             "description": {
                 "type": "string",
                 "description": (
@@ -85,7 +92,7 @@ _SCENES_PROPERTY = {
             },
             "reason": {"type": "string", "description": "One short line: why this frame is or is not worth keeping"},
         },
-        "required": ["time", "description", "keep_screenshot", "reason"],
+        "required": ["time", "frame", "description", "keep_screenshot", "reason"],
         "additionalProperties": False,
     },
     "description": "Scene-by-scene breakdown, one entry per distinct moment, in chronological order",
@@ -127,6 +134,8 @@ class Summary:
     takeaways: tuple[str, ...]
     scenes: tuple[Scene, ...] = ()  # empty unless the model saw the frames
     category: str | None = None  # one of Settings.categories; None when no summary ran
+    # The frames the contact sheets were built from, in cell-number order: scene.frame indexes these.
+    frames: tuple[ocr.Frame, ...] = ()
 
 
 def build_prompt(audience: str, with_frames: bool = False, categories: Sequence[str] = ()) -> str:
@@ -144,11 +153,15 @@ def build_prompt(audience: str, with_frames: bool = False, categories: Sequence[
         prompt += (
             f"\nYou are also given contact sheets of frames sampled from the video. Each cell is one frame, "
             f"laid out {ocr.GRID_COLS} per row in chronological order, left to right then top to bottom, with "
-            "its timestamp printed in the top-left corner of the cell. Read them as a filmstrip: use them for "
+            "its number and timestamp printed in the top-left corner of the cell ('#7 00:04' is frame 7, "
+            "at 00:04; several frames can share a second). Read them as a filmstrip: use them for "
             "what happens on screen, the actions, results and quantities that are shown rather than said. The "
             "frames are a source like the others, so report what they show and invent nothing.\n"
             "Also return scenes: a chronological breakdown of the video, one entry per distinct moment, "
-            "timestamped with the label printed on the frame it came from. Describe each moment concretely "
+            "with time set to the timestamp printed on the first frame of the moment and frame set to the "
+            "number of the frame that shows it best. The frame numbers are for that field only: the reader "
+            "never sees the contact sheets, so never mention frame numbers in a description or reason. "
+            "Describe each moment concretely "
             "and in detail — who or what is on screen, what they are doing, the setting and objects around "
             "them, how the shot is framed and when it cuts or the camera moves, and any text, numbers or "
             "labels visible in the frame, quoted exactly. Write several sentences for a moment that has that "
@@ -167,7 +180,9 @@ def build_prompt(audience: str, with_frames: bool = False, categories: Sequence[
             "to camera, reaction shots, b-roll that only illustrates what is being said, transitions, "
             "blurry or mid-cut frames, on-screen text that just repeats the spoken words or the "
             "caption, and sponsor or self-promotion segments, logos and end cards. When several "
-            "scenes show the same information, keep only the clearest one. Most "
+            "scenes show the same information, keep only the clearest one. The screenshot is exactly the "
+            "frame you number, so for a kept scene choose the frame where the information is fully on screen "
+            "and legible, not a transition into it. Most "
             "videos need zero to four screenshots; a talking-head video usually needs none."
         )
     if categories:
@@ -255,26 +270,29 @@ def _cli_prompt(
 # in the request — they are the cheap overview — the directory is only for a second look.
 
 
-def frame_filename(seconds: float) -> str:
-    """``00-03.png``: the cell's timestamp, with the colon swapped for a filesystem-safe dash."""
-    return f"{ocr.timestamp(seconds).replace(':', '-')}.png"
+def frame_filename(number: int, seconds: float) -> str:
+    """``07_00-03.png``: the cell's label (``#7 00:03``) made filesystem-safe.
+
+    The number keeps two frames from the same second apart; the timestamp alone would overwrite one.
+    """
+    return f"{number:02d}_{ocr.timestamp(seconds).replace(':', '-')}.png"
 
 
 def write_frames(frames: Sequence[ocr.Frame], parent: Path) -> Path:
     """The sampled frames as timestamp-named PNGs, at the resolution they were sampled at."""
     directory = parent / "frames"
     directory.mkdir(parents=True, exist_ok=True)
-    for frame in frames:
-        (directory / frame_filename(frame.seconds)).write_bytes(frame.png)
+    for number, frame in enumerate(frames, 1):
+        (directory / frame_filename(number, frame.seconds)).write_bytes(frame.png)
     return directory
 
 
 def agentic_instructions(directory: Path, frames: Sequence[ocr.Frame]) -> str:
     """Tell the agent the directory and what is in it. Without the inventory it guesses filenames."""
-    inventory = ", ".join(frame_filename(frame.seconds) for frame in frames)
+    inventory = ", ".join(frame_filename(number, frame.seconds) for number, frame in enumerate(frames, 1))
     return (
         f"\n\nThe contact sheets give you the overview. The full-resolution originals are in "
-        f"{directory}, named by timestamp: {inventory}. Open any frame you need to read text, "
+        f"{directory}, named <frame number>_<mm-ss>.png: {inventory}. Open any frame you need to read text, "
         f"identify people or objects, or examine a moment more closely before writing your scenes. "
         f"You can only read those files — everything else is off, and you still reply with the "
         f"JSON object and nothing else."
@@ -303,23 +321,34 @@ def _scene_time(raw: object) -> str:
         return text
 
 
+def _frame_number(raw: object) -> int | None:
+    """The cell number: 7, "7" or "#7" (CLI backends are not schema-enforced). None when absent."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    match = re.fullmatch(r"\s*#?\s*(\d+)\s*", str(raw or ""))
+    return int(match.group(1)) if match else None
+
+
 def _scenes(raw: object) -> tuple[Scene, ...]:
     """Whatever the model called a scene, as Scenes. Anything unusable is dropped, not raised."""
     if not isinstance(raw, list):
         return ()
     scenes = []
     for item in raw:
-        keep, reason = False, ""
+        keep, reason, frame = False, "", None
         if isinstance(item, dict):
             time, description = item.get("time"), str(item.get("description") or "").strip()
             keep = _truthy(item.get("keep_screenshot"))
             reason = str(item.get("reason") or "").strip()
+            frame = _frame_number(item.get("frame"))
         elif isinstance(item, str):  # a backend that ignored the schema answers with plain lines
             time, description = None, item.strip()
         else:
             continue
         if description:
-            scenes.append(Scene(time=_scene_time(time), description=description, keep=keep, reason=reason))
+            scenes.append(Scene(time=_scene_time(time), description=description, keep=keep, reason=reason, frame=frame))
     return tuple(scenes)
 
 
@@ -624,7 +653,7 @@ async def summarize(
     except Exception as exc:  # noqa: BLE001 (summary is best-effort; the verbatim note is still written)
         logger.warning("summary failed (%s): %s", settings.summary_provider, exc)
         return Summary(fallback_title, "", ())
-    summary = _coerce(data, fallback_title, settings.categories)
+    summary = replace(_coerce(data, fallback_title, settings.categories), frames=tuple(selected))
     kept = sum(scene.keep for scene in summary.scenes)
     logger.info("summary: category=%s, %d of %d scenes kept", summary.category, kept, len(summary.scenes))
     return summary

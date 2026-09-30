@@ -26,12 +26,17 @@ class Scene:
     keep: bool = False
     reason: str = ""  # one line on why it was kept or skipped, for tuning the prompt
     image_path: str | None = None  # the saved screenshot, relative to the note's folder; set by the pipeline
+    # The contact-sheet cell number ("#7") that best shows this moment. A scene often merges several
+    # cells, so this, not ``time``, picks the frame a kept scene's screenshot is taken from.
+    frame: int | None = None
 
     def with_image(self, path: str) -> Scene:
         return replace(self, image_path=path)
 
     def to_dict(self) -> dict:
         data = {"time": self.time, "description": self.description, "keep": self.keep, "reason": self.reason}
+        if self.frame is not None:
+            data["frame"] = self.frame
         if self.image_path:
             data["image_path"] = self.image_path
         return data

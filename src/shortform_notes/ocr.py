@@ -79,13 +79,16 @@ class Frame:
 
 @dataclass(frozen=True)
 class Grid:
-    """A contact sheet: several frames tiled into one PNG, each cell labelled with its timestamp."""
+    """A contact sheet: several frames tiled into one PNG, each cell labelled ``#<number> <mm:ss>``."""
 
     png: bytes
     seconds: tuple[float, ...]  # cell timestamps, row-major
+    numbers: tuple[int, ...] = ()  # the cells' 1-based frame numbers, row-major (see ``cell_label``)
 
     def describe(self) -> str:
         span = f"{timestamp(self.seconds[0])} to {timestamp(self.seconds[-1])}"
+        if self.numbers:
+            span = f"#{self.numbers[0]} to #{self.numbers[-1]}, {span}"
         return f"{len(self.seconds)} frames, {span}"
 
 
@@ -368,8 +371,25 @@ def parse_timestamp(label: str) -> float | None:
     return seconds
 
 
+def cell_label(number: int, seconds: float) -> str:
+    """What a contact-sheet cell is labelled with: ``#7 00:04``.
+
+    The number is the frame's 1-based position in the list that was tiled. Timestamps alone are
+    ambiguous (a fast-cut reel has several frames inside one second), so the model names the
+    cell by number and the screenshot is that exact frame.
+    """
+    return f"#{number} {timestamp(seconds)}"
+
+
+def frame_by_number(frames: Sequence[Frame], number: int | None) -> Frame | None:
+    """The frame a ``cell_label`` number points at; None when it is missing or out of range."""
+    if number is None or not 1 <= number <= len(frames):
+        return None
+    return frames[number - 1]
+
+
 def nearest_frame(frames: Sequence[Frame], label: str) -> Frame | None:
-    """The sampled frame a scene's ``mm:ss`` label came from.
+    """The sampled frame a scene's ``mm:ss`` label came from; the fallback when it gave no frame number.
 
     The label is the contact-sheet cell's, which ``timestamp`` truncated to whole seconds, so the
     frame that produced it is the one whose truncated time matches; failing an exact match (a
@@ -405,16 +425,17 @@ def _tile_sync(frames: list[Frame], cols: int, rows: int, cell_max_side: int) ->
     grids: list[Grid] = []
     for start in range(0, len(frames), per_sheet):
         batch = frames[start : start + per_sheet]
-        cells = []
-        for frame in batch:
+        cells, labelled = [], []
+        for number, frame in enumerate(batch, start + 1):
             img = cv2.imdecode(np.frombuffer(frame.png, dtype="uint8"), cv2.IMREAD_COLOR)
             if img is None:
                 continue
             h, w = img.shape[:2]
             scale = min(1.0, cell_max_side / max(h, w))
             img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-            _label(img, timestamp(frame.seconds))
+            _label(img, cell_label(number, frame.seconds))
             cells.append(img)
+            labelled.append((number, frame.seconds))
         if not cells:
             continue
         # One cell size for the whole sheet (every frame shares the video's aspect ratio); pad the last row.
@@ -425,7 +446,13 @@ def _tile_sync(frames: list[Frame], cols: int, rows: int, cell_max_side: int) ->
         sheet = np.vstack([np.hstack(padded[i : i + cols]) for i in range(0, len(padded), cols)])
         ok, buf = cv2.imencode(".png", sheet)
         if ok:
-            grids.append(Grid(png=buf.tobytes(), seconds=tuple(f.seconds for f in batch[: len(cells)])))
+            grids.append(
+                Grid(
+                    png=buf.tobytes(),
+                    seconds=tuple(sec for _, sec in labelled),
+                    numbers=tuple(num for num, _ in labelled),
+                )
+            )
     return grids
 
 
